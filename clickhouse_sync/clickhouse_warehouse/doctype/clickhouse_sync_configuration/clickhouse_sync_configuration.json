@@ -1,0 +1,246 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:source_doctype",
+ "creation": "2026-01-01 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "source_doctype",
+  "enabled",
+  "column_break_head",
+  "priority",
+  "scheduler_enabled",
+  "sync_section",
+  "sync_mode",
+  "batch_size",
+  "column_break_sync",
+  "auto_create_table",
+  "auto_update_schema",
+  "optimize_after_sync",
+  "optimize_only_on_full",
+  "reconcile_deletes_incremental",
+  "sync_child_tables",
+  "delete_strategy",
+  "privacy_section",
+  "excluded_fields",
+  "retry_section",
+  "retry_count",
+  "column_break_retry",
+  "retry_interval",
+  "state_section",
+  "last_sync_timestamp",
+  "column_break_state",
+  "last_status"
+ ],
+ "fields": [
+  {
+   "fieldname": "source_doctype",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Source DocType",
+   "options": "DocType",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Enabled"
+  },
+  {
+   "fieldname": "column_break_head",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "10",
+   "description": "Lower numbers run first when syncing all configurations.",
+   "fieldname": "priority",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Priority"
+  },
+  {
+   "default": "1",
+   "description": "Include this configuration in scheduled runs.",
+   "fieldname": "scheduler_enabled",
+   "fieldtype": "Check",
+   "label": "Scheduler Enabled"
+  },
+  {
+   "fieldname": "sync_section",
+   "fieldtype": "Section Break",
+   "label": "Sync Behaviour"
+  },
+  {
+   "default": "Incremental",
+   "fieldname": "sync_mode",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Sync Mode",
+   "options": "Full\nIncremental",
+   "reqd": 1
+  },
+  {
+   "default": "25000",
+   "description": "Rows per batch. Common values: 10000, 25000, 50000.",
+   "fieldname": "batch_size",
+   "fieldtype": "Int",
+   "label": "Batch Size"
+  },
+  {
+   "fieldname": "column_break_sync",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "fieldname": "auto_create_table",
+   "fieldtype": "Check",
+   "label": "Auto Create Table"
+  },
+  {
+   "default": "1",
+   "fieldname": "auto_update_schema",
+   "fieldtype": "Check",
+   "label": "Auto Update Schema"
+  },
+  {
+   "default": "1",
+   "description": "Run OPTIMIZE TABLE ... FINAL after each sync so the ClickHouse table holds exactly one physical row per record (latest version). Disable for very large tables where the rewrite cost is significant; query with FINAL instead.",
+   "fieldname": "optimize_after_sync",
+   "fieldtype": "Check",
+   "label": "Optimize After Sync"
+  },
+  {
+   "default": "0",
+   "depends_on": "optimize_after_sync",
+   "description": "Only run OPTIMIZE after Full syncs, never after Incremental. Recommended for large, frequently-synced tables so incremental ticks don't trigger a full-table rewrite each time.",
+   "fieldname": "optimize_only_on_full",
+   "fieldtype": "Check",
+   "label": "Optimize Only On Full Sync"
+  },
+  {
+   "default": "0",
+   "description": "Also reconcile deletes on Incremental syncs (compares the full name set against the source). Catches deletions the real-time hook can miss - rows deleted while a sync was down, bulk or direct-DB deletes. Adds a full name scan per run, so enable it for tables where delete accuracy matters more than sync speed. No effect when Delete Strategy is Ignore.",
+   "fieldname": "reconcile_deletes_incremental",
+   "fieldtype": "Check",
+   "label": "Reconcile Deletes On Incremental"
+  },
+  {
+   "default": "0",
+   "description": "Also sync this DocType's child tables (grid rows like invoice line items) into their own ClickHouse tables, joinable back via the parent column. Follows this configuration's sync mode and exclusions.",
+   "fieldname": "sync_child_tables",
+   "fieldtype": "Check",
+   "label": "Sync Child Tables"
+  },
+  {
+   "default": "Ignore",
+   "description": "How to treat rows deleted in Frappe but still in ClickHouse.",
+   "fieldname": "delete_strategy",
+   "fieldtype": "Select",
+   "label": "Delete Strategy",
+   "options": "Ignore\nSoft Delete\nHard Delete"
+  },
+  {
+   "fieldname": "privacy_section",
+   "fieldtype": "Section Break",
+   "label": "Privacy / Field Exclusion"
+  },
+  {
+   "description": "Fields removed from the ClickHouse table entirely (personal/sensitive columns). Use the 'Select Fields to Exclude' button under Privacy to pick them from a list rather than typing.",
+   "fieldname": "excluded_fields",
+   "fieldtype": "Small Text",
+   "label": "Excluded Fields"
+  },
+  {
+   "fieldname": "retry_section",
+   "fieldtype": "Section Break",
+   "label": "Retry"
+  },
+  {
+   "default": "3",
+   "description": "Maximum attempts on transient failure.",
+   "fieldname": "retry_count",
+   "fieldtype": "Int",
+   "label": "Retry Count"
+  },
+  {
+   "fieldname": "column_break_retry",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "5",
+   "description": "Base seconds between retries (exponential backoff).",
+   "fieldname": "retry_interval",
+   "fieldtype": "Int",
+   "label": "Retry Interval (s)"
+  },
+  {
+   "fieldname": "state_section",
+   "fieldtype": "Section Break",
+   "label": "State"
+  },
+  {
+   "description": "Incremental cursor. Rows modified at/after this are re-synced.",
+   "fieldname": "last_sync_timestamp",
+   "fieldtype": "Datetime",
+   "label": "Last Sync Timestamp",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_state",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_status",
+   "fieldtype": "Data",
+   "label": "Last Status",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [
+  {
+   "group": "Logs",
+   "link_doctype": "ClickHouse Sync Log",
+   "link_fieldname": "configuration"
+  }
+ ],
+ "modified": "2026-01-01 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ClickHouse Warehouse",
+ "name": "ClickHouse Sync Configuration",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "ClickHouse Sync Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "quick_entry": 1,
+ "sort_field": "priority",
+ "sort_order": "ASC",
+ "states": [],
+ "track_changes": 1
+}

@@ -1,0 +1,3 @@
+# Patches applied by `bench migrate`, in order. One dotted path per line.
+# (No data patches required for the initial 1.0.0 release.)
+clickhouse_sync.patches.rename_module_to_warehouse

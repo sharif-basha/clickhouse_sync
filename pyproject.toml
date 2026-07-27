@@ -1,0 +1,13 @@
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "clickhouse_sync"
+version = "1.7.0"
+description = "Sync ERPNext DocTypes to ClickHouse with retry, batching, Telegram alerts and analytics."
+requires-python = ">=3.10"
+dependencies = ["clickhouse-connect>=0.7.0", "requests>=2.28.0"]
+
+[tool.flit.module]
+name = "clickhouse_sync"

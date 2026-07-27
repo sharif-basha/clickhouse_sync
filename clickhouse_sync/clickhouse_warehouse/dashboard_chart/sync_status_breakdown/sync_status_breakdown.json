@@ -1,0 +1,22 @@
+{
+ "chart_name": "Sync Status Breakdown",
+ "chart_type": "Group By",
+ "creation": "2026-01-01 00:00:00.000000",
+ "doctype": "Dashboard Chart",
+ "document_type": "ClickHouse Sync Log",
+ "dynamic_filters_json": "[]",
+ "filters_json": "[]",
+ "group_by_based_on": "status",
+ "group_by_type": "Count",
+ "is_public": 1,
+ "is_standard": 1,
+ "module": "ClickHouse Warehouse",
+ "modified": "2026-01-01 00:00:00.000000",
+ "name": "Sync Status Breakdown",
+ "number_of_groups": 0,
+ "owner": "Administrator",
+ "timeseries": 0,
+ "timespan": "Last Month",
+ "type": "Donut",
+ "use_report_chart": 0
+}

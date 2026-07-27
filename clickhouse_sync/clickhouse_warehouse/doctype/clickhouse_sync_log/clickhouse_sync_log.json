@@ -1,0 +1,175 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:CHSYNC-{YY}{MM}{DD}-{#####}",
+ "creation": "2026-01-01 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "configuration",
+  "status",
+  "column_break_head",
+  "trigger",
+  "execution_host",
+  "timing_section",
+  "start_time",
+  "end_time",
+  "column_break_timing",
+  "duration",
+  "rows_section",
+  "rows_read",
+  "rows_written",
+  "column_break_rows",
+  "rows_failed",
+  "detail_section",
+  "message",
+  "exception"
+ ],
+ "fields": [
+  {
+   "fieldname": "configuration",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Configuration",
+   "options": "ClickHouse Sync Configuration",
+   "reqd": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Queued\nRunning\nCompleted\nFailed\nCancelled"
+  },
+  {
+   "fieldname": "column_break_head",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "trigger",
+   "fieldtype": "Select",
+   "in_standard_filter": 1,
+   "label": "Trigger",
+   "options": "Manual\nScheduler"
+  },
+  {
+   "fieldname": "execution_host",
+   "fieldtype": "Data",
+   "label": "Execution Host",
+   "read_only": 1
+  },
+  {
+   "fieldname": "timing_section",
+   "fieldtype": "Section Break",
+   "label": "Timing"
+  },
+  {
+   "fieldname": "start_time",
+   "fieldtype": "Datetime",
+   "label": "Start Time",
+   "read_only": 1
+  },
+  {
+   "fieldname": "end_time",
+   "fieldtype": "Datetime",
+   "label": "End Time",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_timing",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Total run time in seconds.",
+   "fieldname": "duration",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Duration (s)",
+   "precision": "3",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rows_section",
+   "fieldtype": "Section Break",
+   "label": "Rows"
+  },
+  {
+   "fieldname": "rows_read",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Rows Read",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rows_written",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Rows Written",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_rows",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "rows_failed",
+   "fieldtype": "Int",
+   "label": "Rows Failed",
+   "read_only": 1
+  },
+  {
+   "fieldname": "detail_section",
+   "fieldtype": "Section Break",
+   "label": "Detail"
+  },
+  {
+   "fieldname": "message",
+   "fieldtype": "Small Text",
+   "label": "Message",
+   "read_only": 1
+  },
+  {
+   "fieldname": "exception",
+   "fieldtype": "Code",
+   "label": "Exception / Stack Trace",
+   "options": "Text",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-01-01 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ClickHouse Warehouse",
+ "name": "ClickHouse Sync Log",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "ClickHouse Sync Manager",
+   "share": 1
+  }
+ ],
+ "quick_entry": 0,
+ "read_only": 1,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

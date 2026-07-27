@@ -1,0 +1,2 @@
+clickhouse-connect>=0.7.0
+requests>=2.28.0

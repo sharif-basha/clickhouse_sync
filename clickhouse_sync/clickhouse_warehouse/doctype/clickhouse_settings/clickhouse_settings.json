@@ -1,0 +1,224 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-01-01 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "connection_section",
+  "host",
+  "port",
+  "database",
+  "column_break_conn",
+  "username",
+  "password",
+  "secure",
+  "compression",
+  "tuning_section",
+  "connection_timeout",
+  "send_receive_timeout",
+  "column_break_tuning",
+  "max_threads",
+  "max_insert_block_size",
+  "default_engine",
+  "alerts_section",
+  "staleness_alert_hours",
+  "actions_section",
+  "connection_status",
+  "telegram_section",
+  "alert_mode",
+  "alert_on",
+  "telegram_bot_token",
+  "telegram_chat_id"
+ ],
+ "fields": [
+  {
+   "fieldname": "connection_section",
+   "fieldtype": "Section Break",
+   "label": "Connection"
+  },
+  {
+   "fieldname": "host",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Host",
+   "reqd": 1
+  },
+  {
+   "default": "8123",
+   "fieldname": "port",
+   "fieldtype": "Int",
+   "label": "Port",
+   "reqd": 1
+  },
+  {
+   "fieldname": "database",
+   "fieldtype": "Data",
+   "label": "Database",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_conn",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "default",
+   "fieldname": "username",
+   "fieldtype": "Data",
+   "label": "Username"
+  },
+  {
+   "fieldname": "password",
+   "fieldtype": "Password",
+   "label": "Password"
+  },
+  {
+   "default": "0",
+   "description": "Use TLS (HTTPS). Typically port 8443 when enabled.",
+   "fieldname": "secure",
+   "fieldtype": "Check",
+   "label": "Secure (TLS)"
+  },
+  {
+   "default": "1",
+   "description": "Enable LZ4 payload compression for inserts and queries.",
+   "fieldname": "compression",
+   "fieldtype": "Check",
+   "label": "Compression"
+  },
+  {
+   "fieldname": "tuning_section",
+   "fieldtype": "Section Break",
+   "label": "Tuning"
+  },
+  {
+   "default": "10",
+   "description": "Seconds to wait when establishing a connection.",
+   "fieldname": "connection_timeout",
+   "fieldtype": "Int",
+   "label": "Connection Timeout (s)"
+  },
+  {
+   "default": "300",
+   "description": "Seconds to wait for query/insert send + receive.",
+   "fieldname": "send_receive_timeout",
+   "fieldtype": "Int",
+   "label": "Send/Receive Timeout (s)"
+  },
+  {
+   "fieldname": "column_break_tuning",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "description": "ClickHouse max_threads per query. 0 = server default.",
+   "fieldname": "max_threads",
+   "fieldtype": "Int",
+   "label": "Max Threads"
+  },
+  {
+   "default": "1048576",
+   "description": "ClickHouse max_insert_block_size setting.",
+   "fieldname": "max_insert_block_size",
+   "fieldtype": "Int",
+   "label": "Max Insert Block Size"
+  },
+  {
+   "default": "MergeTree",
+   "description": "Default table engine used when auto-creating tables.",
+   "fieldname": "default_engine",
+   "fieldtype": "Data",
+   "label": "Default Engine"
+  },
+  {
+   "fieldname": "alerts_section",
+   "fieldtype": "Section Break",
+   "label": "Alerts"
+  },
+  {
+   "default": "0",
+   "description": "Raise a notification when an enabled configuration has not completed a successful sync within this many hours. 0 disables staleness alerts. Checked hourly by the scheduler.",
+   "fieldname": "staleness_alert_hours",
+   "fieldtype": "Int",
+   "label": "Staleness Alert Hours"
+  },
+  {
+   "fieldname": "actions_section",
+   "fieldtype": "Section Break",
+   "label": "Status"
+  },
+  {
+   "fieldname": "connection_status",
+   "fieldtype": "Small Text",
+   "label": "Connection Status",
+   "read_only": 1
+  },
+  {
+   "fieldname": "telegram_section",
+   "fieldtype": "Section Break",
+   "label": "Telegram Alerts",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "alert_on",
+   "fieldtype": "Select",
+   "label": "Per-Run: Send On",
+   "options": "Failures\nAll\nNever",
+   "default": "Failures",
+   "description": "Only applies in 'Per Run' mode: whether each run alerts on Failures, All, or Never.",
+   "depends_on": "eval:doc.alert_mode=='Per Run'"
+  },
+  {
+   "fieldname": "telegram_bot_token",
+   "fieldtype": "Password",
+   "label": "Telegram Bot Token",
+   "description": "Optional. If blank, falls back to Zoom Telegram Settings (if the zoom_meeting app is installed)."
+  },
+  {
+   "fieldname": "telegram_chat_id",
+   "fieldtype": "Data",
+   "label": "Telegram Chat ID",
+   "description": "Chat or group id that receives sync alerts."
+  },
+  {
+   "fieldname": "alert_mode",
+   "fieldtype": "Select",
+   "label": "Alert Mode",
+   "options": "Consolidated\nPer Run\nNever",
+   "default": "Consolidated",
+   "description": "Consolidated (recommended): one digest per sync batch, sent only when something failed, plus a daily summary. Per Run: a message after every run. Never: no alerts."
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-01-01 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ClickHouse Warehouse",
+ "name": "ClickHouse Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "print": 1,
+   "read": 1,
+   "role": "ClickHouse Sync Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "quick_entry": 0,
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

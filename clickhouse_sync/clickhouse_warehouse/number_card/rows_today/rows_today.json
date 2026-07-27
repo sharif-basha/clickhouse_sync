@@ -1,0 +1,17 @@
+{
+ "aggregate_function_based_on": "rows_written",
+ "creation": "2026-01-01 00:00:00.000000",
+ "doctype": "Number Card",
+ "document_type": "ClickHouse Sync Log",
+ "filters_json": "[[\"ClickHouse Sync Log\",\"creation\",\"Timespan\",\"today\",false]]",
+ "function": "Sum",
+ "is_public": 1,
+ "is_standard": 1,
+ "label": "Rows Synced (Today)",
+ "module": "ClickHouse Warehouse",
+ "modified": "2026-01-01 00:00:00.000000",
+ "name": "Rows Today",
+ "owner": "Administrator",
+ "show_percentage_stats": 0,
+ "type": "Document Type"
+}

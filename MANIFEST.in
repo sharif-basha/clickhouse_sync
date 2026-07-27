@@ -1,0 +1,4 @@
+include requirements.txt
+include *.json
+recursive-include clickhouse_sync *.css *.csv *.html *.ico *.js *.json *.md *.png *.py *.svg *.txt
+recursive-exclude clickhouse_sync *.pyc

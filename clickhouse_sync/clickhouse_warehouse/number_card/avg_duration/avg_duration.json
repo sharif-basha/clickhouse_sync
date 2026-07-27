@@ -1,0 +1,17 @@
+{
+ "aggregate_function_based_on": "duration",
+ "creation": "2026-01-01 00:00:00.000000",
+ "doctype": "Number Card",
+ "document_type": "ClickHouse Sync Log",
+ "filters_json": "[[\"ClickHouse Sync Log\",\"status\",\"=\",\"Completed\",false]]",
+ "function": "Average",
+ "is_public": 1,
+ "is_standard": 1,
+ "label": "Average Duration (s)",
+ "module": "ClickHouse Warehouse",
+ "modified": "2026-01-01 00:00:00.000000",
+ "name": "Average Duration",
+ "owner": "Administrator",
+ "show_percentage_stats": 0,
+ "type": "Document Type"
+}
