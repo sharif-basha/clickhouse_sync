@@ -82,10 +82,8 @@ def _format_message(config_name: str, trigger: str, result: "SyncResult") -> str
     ]
     if result.rows_failed:
         lines.append(f"Rows failed: {result.rows_failed:,}")
-    try:
-        lines.append(f"Duration: {result.duration():.1f}s")
-    except Exception:  # noqa: BLE001
-        pass
+    # ``duration`` is a property on SyncResult (seconds as a float).
+    lines.append(f"Duration: {float(result.duration or 0):.1f}s")
     if result.status not in ("Completed", "Success") and result.message:
         msg = frappe.utils.escape_html(str(result.message)[:300])
         lines.append(f"\n<code>{msg}</code>")
