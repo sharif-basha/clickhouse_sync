@@ -14,7 +14,7 @@ from __future__ import annotations
 import frappe
 from frappe.utils import add_to_date, cint, get_datetime, now_datetime
 
-from clickhouse_sync.clickhouse import sync_engine
+from clickhouse_sync.clickhouse import live_status, sync_engine
 from clickhouse_sync.clickhouse.sync_engine import propagate_delete  # re-exported
 
 __all__ = [
@@ -27,17 +27,21 @@ __all__ = [
 ]
 
 
-def run_configuration_sync(config_name: str, trigger: str = "Manual") -> dict:
+def run_configuration_sync(
+    config_name: str, trigger: str = "Manual", mode: str | None = None
+) -> dict:
     """Background-job target: run one configuration end to end.
 
     Args:
         config_name: Name of the ClickHouse Sync Configuration.
         trigger: ``"Manual"`` or ``"Scheduler"`` - recorded on the log.
+        mode: Optional one-off sync mode (``"Full"`` or ``"Incremental"``)
+            chosen on the dashboard; ``None`` uses the configuration's mode.
 
     Returns:
         A compact result dict (status + row counts) for job introspection.
     """
-    result = sync_engine.run_sync(config_name, trigger=trigger)
+    result = sync_engine.run_sync(config_name, trigger=trigger, mode=mode)
     return {
         "configuration": config_name,
         "status": result.status,
@@ -76,6 +80,7 @@ def _enqueue_enabled_configs(trigger: str = "Scheduler") -> list[str]:
             config_name=config.name,
             trigger=trigger,
         )
+        live_status.mark_queued(config.name, None, trigger, None, job_id)
         enqueued.append(config.name)
 
     if enqueued:

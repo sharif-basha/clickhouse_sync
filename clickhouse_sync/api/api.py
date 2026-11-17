@@ -24,6 +24,7 @@ from frappe import _
 from frappe.utils import cint, get_datetime, now_datetime
 
 from clickhouse_sync.clickhouse import connection as ch_connection
+from clickhouse_sync.clickhouse import live_status
 from clickhouse_sync.clickhouse import schema as ch_schema
 from clickhouse_sync.clickhouse import sync_engine
 
@@ -70,6 +71,7 @@ def sync_now(configuration: str, trigger: str = "Manual") -> dict[str, Any]:
         config_name=configuration,
         trigger=trigger,
     )
+    live_status.mark_queued(configuration, None, trigger, None, job_id)
     return {"queued": True, "job_id": job_id, "configuration": configuration}
 
 
@@ -95,6 +97,7 @@ def sync_all(trigger: str = "Manual") -> dict[str, Any]:
             config_name=config.name,
             trigger=trigger,
         )
+        live_status.mark_queued(config.name, None, trigger, None, job_id)
         queued.append(config.name)
     return {"queued": queued, "count": len(queued)}
 
