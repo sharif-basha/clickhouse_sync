@@ -28,8 +28,9 @@ Design notes
   loop exit cleanly and mark the log ``Cancelled``.
 * **Retryable**: transient failures are retried with exponential backoff; the
   retry count/interval come from the configuration.
-* **Observable**: progress is published over Frappe realtime, and every run
-  (and every retry) is recorded in a ClickHouse Sync Log document.
+* **Observable**: progress is published over Frappe realtime and written to
+  a live record in Redis (:mod:`live_status`) that the monitoring dashboard
+  reads; every run is recorded in a ClickHouse Sync Log document.
 """
 
 from __future__ import annotations
@@ -45,9 +46,11 @@ import frappe
 from frappe.utils import cint, get_datetime, now_datetime
 
 from clickhouse_sync.clickhouse import connection as ch_connection
+from clickhouse_sync.clickhouse import live_status
 from clickhouse_sync.clickhouse.exceptions import (
     ClickHouseSyncError,
     SyncCancelledError,
+    categorize_error,
     is_transient_error,
 )
 from clickhouse_sync.clickhouse.schema import (
@@ -70,6 +73,7 @@ CANCEL_CACHE_PREFIX = "clickhouse_sync::cancel::"
 PROGRESS_EVENT = "clickhouse_sync_progress"
 DEFAULT_BATCH_SIZE = 25000
 PROGRESS_THROTTLE_SECONDS = 1.0
+VALID_SYNC_MODES = ("Full", "Incremental")
 
 # Incremental runs start this long *before* the saved cursor. Frappe stamps
 # ``modified`` when a document is saved, not when its transaction commits, so a
@@ -107,6 +111,15 @@ class SyncContext:
     optimize_only_on_full: bool = False
     reconcile_deletes_incremental: bool = False
     sync_child_tables: bool = False
+    # The cursor as it was when the run started. ``last_sync_timestamp`` moves
+    # forward batch by batch; this one never changes during a run. Used to
+    # tell new records (created after the previous sync) from updated ones.
+    previous_cursor: datetime | None = None
+    # ``True`` when this run's mode was chosen on the dashboard and differs
+    # from the configuration's saved mode (e.g. a one-off full resync).
+    mode_overridden: bool = False
+    # Live progress writer for the dashboard (never ``None`` during a run).
+    live: Any = None
     schema: TableSchema = field(init=False)
 
     def __post_init__(self) -> None:
@@ -146,12 +159,43 @@ def _cancel_key(config_name: str) -> str:
 
 
 def request_cancel(config_name: str) -> None:
-    """Signal a running sync for ``config_name`` to stop at the next batch."""
-    frappe.cache().set_value(_cancel_key(config_name), "1", expires_in_sec=3600)
+    """Signal a sync for ``config_name`` to stop at the next batch.
+
+    The flag holds the time it was set, so a sync that is still queued can tell
+    a stop pressed while it waited (honoured) from a stale flag left by an
+    earlier run (ignored).
+    """
+    frappe.cache().set_value(
+        _cancel_key(config_name), now_datetime().isoformat(sep=" "), expires_in_sec=3600
+    )
+
+
+def _cancel_requested_at(config_name: str) -> datetime | None:
+    """When a stop was requested for ``config_name``, if one is pending."""
+    try:
+        cache = frappe.cache()
+        key = _cancel_key(config_name)
+        _forget_local_cache_entry(cache, key)
+        try:
+            value = cache.get_value(key, expires=True)
+        except TypeError:
+            value = cache.get_value(key)
+            _forget_local_cache_entry(cache, key)
+    except Exception:  # noqa: BLE001 - Redis unavailable: no stop request known
+        return None
+    if not value:
+        return None
+    try:
+        return get_datetime(value) if value != "1" else None
+    except Exception:  # noqa: BLE001 - unparseable legacy value
+        return None
 
 
 def _clear_cancel(config_name: str) -> None:
-    frappe.cache().delete_value(_cancel_key(config_name))
+    try:
+        frappe.cache().delete_value(_cancel_key(config_name))
+    except Exception as exc:  # noqa: BLE001 - a Redis outage must not fail the sync
+        frappe.logger("clickhouse_sync").warning(f"could not clear cancel flag for {config_name}: {exc}")
 
 
 def _is_cancelled(config_name: str) -> bool:
@@ -164,15 +208,19 @@ def _is_cancelled(config_name: str) -> bool:
     Drop any local copy before each read, and read with ``expires=True`` so
     the result is not stored locally again.
     """
-    cache = frappe.cache()
-    key = _cancel_key(config_name)
-    _forget_local_cache_entry(cache, key)
     try:
-        value = cache.get_value(key, expires=True)
-    except TypeError:  # very old wrappers without the ``expires`` argument
+        cache = frappe.cache()
+        key = _cancel_key(config_name)
         _forget_local_cache_entry(cache, key)
-        value = cache.get_value(key)
-        _forget_local_cache_entry(cache, key)
+        try:
+            value = cache.get_value(key, expires=True)
+        except TypeError:  # very old wrappers without the ``expires`` argument
+            _forget_local_cache_entry(cache, key)
+            value = cache.get_value(key)
+            _forget_local_cache_entry(cache, key)
+    except Exception as exc:  # noqa: BLE001 - a Redis outage must not fail the sync
+        frappe.logger("clickhouse_sync").warning(f"cancel check failed for {config_name}: {exc}")
+        return False
     return bool(value)
 
 
@@ -194,10 +242,13 @@ def _forget_local_cache_entry(cache: Any, key: str) -> None:
 class ProgressReporter:
     """Throttled publisher of realtime progress events for the Desk UI."""
 
-    def __init__(self, config_name: str, total: int) -> None:
+    def __init__(self, config_name: str, total: int, live: Any = None) -> None:
         self.config_name = config_name
         self.total = max(total, 0)
         self._last_emit = 0.0
+        self.live = live
+        if live is not None:
+            live.update(force=True, total=self.total)
 
     def emit(self, read: int, written: int, phase: str, force: bool = False) -> None:
         now = time.monotonic()
@@ -205,6 +256,8 @@ class ProgressReporter:
             return
         self._last_emit = now
         percent = round((read / self.total) * 100, 1) if self.total else 0.0
+        if self.live is not None:
+            self.live.update(force=True, phase=phase, rows_read=read, rows_written=written)
         frappe.publish_realtime(
             PROGRESS_EVENT,
             {
@@ -222,20 +275,34 @@ class ProgressReporter:
 # --------------------------------------------------------------------------- #
 # Context construction
 # --------------------------------------------------------------------------- #
-def build_context(config_name: str, trigger: str = "Manual") -> SyncContext:
-    """Load a ClickHouse Sync Configuration and build a :class:`SyncContext`."""
+def build_context(
+    config_name: str, trigger: str = "Manual", mode: str | None = None
+) -> SyncContext:
+    """Load a ClickHouse Sync Configuration and build a :class:`SyncContext`.
+
+    Args:
+        config_name: The configuration to load.
+        trigger: ``"Manual"`` or ``"Scheduler"``.
+        mode: Optional one-off override of the configuration's sync mode
+            (``"Full"`` or ``"Incremental"``). The saved configuration is not
+            changed.
+    """
     config = frappe.get_doc("ClickHouse Sync Configuration", config_name)
 
     if not config.enabled:
         raise ClickHouseSyncError(f"Configuration '{config_name}' is disabled.")
+    if mode is not None and mode not in VALID_SYNC_MODES:
+        raise ClickHouseSyncError(f"Unknown sync mode '{mode}'.")
 
+    saved_mode = config.sync_mode or "Full"
+    run_mode = mode or saved_mode
     last_ts = get_datetime(config.last_sync_timestamp) if config.last_sync_timestamp else None
 
     return SyncContext(
         config_name=config.name,
         doctype=config.source_doctype,
         table_name=table_name_for(config.source_doctype),
-        sync_mode=config.sync_mode or "Full",
+        sync_mode=run_mode,
         batch_size=_clamp_batch_size(cint(config.batch_size)),
         auto_create=bool(config.auto_create_table),
         auto_update=bool(config.auto_update_schema),
@@ -251,6 +318,8 @@ def build_context(config_name: str, trigger: str = "Manual") -> SyncContext:
             config.get("reconcile_deletes_incremental"), default=False
         ),
         sync_child_tables=_coerce_flag(config.get("sync_child_tables"), default=False),
+        previous_cursor=last_ts,
+        mode_overridden=run_mode != saved_mode,
     )
 
 
@@ -590,11 +659,14 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
 
     Raises on failure so the retry wrapper can decide whether to retry.
     """
+    live = ctx.live or live_status.NullLiveRun()
+    live.update(force=True, phase="connecting")
     client = ch_connection.get_client()
     params = ch_connection.get_connection_params()
     database = params.database
 
     # 1. Table + schema reconciliation.
+    live.update(force=True, phase="checking schema")
     ensure_table(client, ctx.schema, database, auto_create=ctx.auto_create)
     reconcile_schema(client, ctx.schema, database, auto_update=ctx.auto_update)
 
@@ -612,16 +684,30 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     #    missed child rows were never retried.)
     child_written = 0
     if ctx.sync_child_tables:
+        live.update(force=True, phase="child tables")
         child_written = _sync_child_tables(client, ctx, database, synced_at)
+        live.update(force=True, child_rows_written=child_written)
 
     # 3. Stream + insert parent rows.
     fields = _source_field_order(ctx.schema)
     column_defs = ctx.schema.columns
+    live.update(force=True, phase="counting")
     total = count_source_rows(ctx, watermark)
-    reporter = ProgressReporter(ctx.config_name, total)
+    reporter = ProgressReporter(ctx.config_name, total, live)
     reporter.emit(0, 0, "starting", force=True)
 
     incremental = ctx.sync_mode == "Incremental"
+    # The new / updated / re-checked split is only knowable for incremental
+    # runs that have a previous cursor:
+    #   new        - created after the previous sync position
+    #   updated    - modified after it (but created before)
+    #   re-checked - unchanged since then; re-read only because each run
+    #                starts a safety lag before the cursor
+    split_known = incremental and ctx.previous_cursor is not None
+    rows_new = 0 if split_known else None
+    rows_updated = 0 if split_known else None
+    rows_rechecked = 0 if split_known else None
+    batch_number = 0
     # The cursor never moves backwards: the first window deliberately starts a
     # safety lag before the saved cursor, and those re-read rows must not pull
     # the cursor back with them.
@@ -631,6 +717,7 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
         if _is_cancelled(ctx.config_name):
             raise SyncCancelledError(f"Sync cancelled for {ctx.config_name}.")
 
+        batch_number += 1
         result.rows_read += len(batch)
         columns, data = _prepare_batch(ctx, batch, column_defs, synced_at)
         try:
@@ -638,7 +725,41 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
             result.rows_written += len(data)
         except Exception:  # noqa: BLE001 - count and re-raise for retry
             result.rows_failed += len(data)
+            live.update(
+                force=True,
+                batch=batch_number,
+                rows_read=result.rows_read,
+                rows_failed=result.rows_failed,
+                failed_batch_first=batch[0].get("name"),
+                failed_batch_last=batch[-1].get("name"),
+            )
             raise
+
+        if split_known:
+            for row in batch:
+                created = row.get("creation")
+                modified = row.get("modified")
+                if created is not None and get_datetime(created) > ctx.previous_cursor:
+                    rows_new += 1
+                elif modified is not None and get_datetime(modified) > ctx.previous_cursor:
+                    rows_updated += 1
+                else:
+                    rows_rechecked += 1
+        last_row = batch[-1]
+        # One Redis write per batch (batches are thousands of rows), so the
+        # dashboard always shows the batch that was actually completed.
+        live.update(
+            force=True,
+            phase="syncing",
+            batch=batch_number,
+            rows_read=result.rows_read,
+            rows_written=result.rows_written,
+            rows_new=rows_new,
+            rows_updated=rows_updated,
+            rows_rechecked=rows_rechecked,
+            cursor_modified=last_row.get("modified"),
+            cursor_name=last_row.get("name"),
+        )
 
         # Persist the position after every successful batch => resumable.
         # Incremental batches arrive in (modified, name) order, so every row
@@ -658,6 +779,7 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
         reporter.emit(result.rows_read, result.rows_written, "syncing")
 
     # 4. Delete reconciliation (full sync, or incremental when opted in).
+    live.update(force=True, phase="reconciling deletes", rows_read=result.rows_read, rows_written=result.rows_written)
     deleted = reconcile_deletes(client, ctx, database)
     if deleted:
         result.message = f"{result.rows_written} rows synced, {deleted} deletes reconciled."
@@ -671,6 +793,7 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     # Rows incremental sync can never see (NULL / far-future ``modified``).
     if incremental:
         unreachable = count_unreachable_rows(ctx, watermark)
+        live.update(force=True, rows_skipped=unreachable)
         if unreachable:
             result.message += f" WARNING: {unreachable} row(s) skipped (NULL/future modified)."
             frappe.logger("clickhouse_sync").warning(
@@ -701,7 +824,11 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
         and (ctx.sync_mode == "Full" or not ctx.optimize_only_on_full)
     )
     if should_optimize:
+        live.update(force=True, phase="optimizing")
         _optimize_table(client, database, ctx.table_name)
+
+    if ctx.mode_overridden:
+        result.message = f"[{ctx.sync_mode} sync requested] " + result.message
 
     reporter.emit(result.rows_read, result.rows_written, "completed", force=True)
     result.status = "Completed"
@@ -867,7 +994,9 @@ def _persist_cursor(config_name: str, cursor: datetime) -> None:
 # --------------------------------------------------------------------------- #
 # Public entry point (retry + logging wrapper)
 # --------------------------------------------------------------------------- #
-def run_sync(config_name: str, trigger: str = "Manual") -> SyncResult:
+def run_sync(
+    config_name: str, trigger: str = "Manual", mode: str | None = None
+) -> SyncResult:
     """Run a full sync pipeline for one configuration, with retry + logging.
 
     This is the single public entry point used by the scheduler, the API and
@@ -879,29 +1008,51 @@ def run_sync(config_name: str, trigger: str = "Manual") -> SyncResult:
     Args:
         config_name: Name of the ClickHouse Sync Configuration to run.
         trigger: ``"Scheduler"`` or ``"Manual"`` - recorded on the log.
+        mode: Optional one-off sync mode (``"Full"``/``"Incremental"``)
+            overriding the configuration for this run only.
 
     Returns:
         A populated :class:`SyncResult`.
     """
     result = SyncResult(start_time=now_datetime(), status="Running")
     logger = frappe.logger("clickhouse_sync")
+
+    # A stop pressed while this job was still waiting in the queue is honoured
+    # here; any older flag (left by a previous run) is discarded.
+    queued = live_status.get_live(config_name) or {}
+    stop_at = _cancel_requested_at(config_name)
+    queued_at = get_datetime(queued["queued_at"]) if queued.get("queued_at") else None
     _clear_cancel(config_name)
+    live = live_status.start_run(config_name, None, trigger, mode, max_attempts=1)
+    if stop_at and queued_at and stop_at >= queued_at:
+        result.status = "Cancelled"
+        result.message = "Sync cancelled before it started."
+        result.end_time = now_datetime()
+        _write_log(config_name, trigger, result)
+        live.finish("Cancelled", result.log_name, result.message, "Cancelled")
+        return result
 
     try:
-        ctx = build_context(config_name, trigger=trigger)
+        ctx = build_context(config_name, trigger=trigger, mode=mode)
     except Exception as exc:  # noqa: BLE001 - config errors are terminal
         result.status = "Failed"
         result.end_time = now_datetime()
         result.exception = traceback.format_exc()
         result.message = str(exc)
         _write_log(config_name, trigger, result)
+        live.finish("Failed", result.log_name, result.message, "Configuration")
         logger.error(f"Sync config load failed for {config_name}: {exc}")
         return result
+
+    ctx.live = live
+    live.update(force=True, doctype=ctx.doctype, mode=ctx.sync_mode, max_attempts=ctx.retry_count)
+    category: str | None = None
 
     attempt = 0
     try:
         while True:
             attempt += 1
+            live.update(force=True, attempt=attempt)
             try:
                 if attempt > 1:
                     # Force a fresh connection for the retry. This sits INSIDE
@@ -914,6 +1065,7 @@ def run_sync(config_name: str, trigger: str = "Manual") -> SyncResult:
             except SyncCancelledError as exc:
                 result.status = "Cancelled"
                 result.message = str(exc)
+                category = "Cancelled"
                 break
             except Exception as exc:  # noqa: BLE001
                 transient = is_transient_error(exc)
@@ -921,11 +1073,16 @@ def run_sync(config_name: str, trigger: str = "Manual") -> SyncResult:
                     f"Sync attempt {attempt}/{ctx.retry_count} failed for "
                     f"{config_name} (transient={transient}): {exc}"
                 )
+                live.update(force=True, last_error=str(exc)[:300])
                 if attempt >= ctx.retry_count or not transient:
                     result.status = "Failed"
                     result.exception = traceback.format_exc()
                     result.message = str(exc)
+                    category = categorize_error(exc)
                     break
+                # Only now is it certain another attempt follows; the phase the
+                # failure happened in stays recorded until this point.
+                live.update(force=True, phase="retrying")
                 # Reset per-attempt counters before the next attempt.
                 result.rows_read = 0
                 result.rows_written = 0
@@ -940,10 +1097,12 @@ def run_sync(config_name: str, trigger: str = "Manual") -> SyncResult:
         result.message = f"Sync interrupted: {type(exc).__name__}: {exc}"
         result.end_time = now_datetime()
         _write_log(config_name, trigger, result)
+        live.finish("Failed", result.log_name, result.message, "Interrupted")
         raise
 
     result.end_time = now_datetime()
     _write_log(config_name, trigger, result)
+    live.finish(result.status, result.log_name, result.message, category)
 
     # Fire an optional Telegram alert (governed by ClickHouse Settings.alert_on).
     # This never raises - alerting problems must not affect the sync outcome.

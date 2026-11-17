@@ -45,12 +45,38 @@ form.
 
 ## Dashboard
 
-A dashboard page (`/app/clickhouse-sync-dashboard`) shows:
+The monitoring console at `/app/clickhouse-sync-dashboard` (System Manager or
+ClickHouse Sync Manager) shows:
 
-- A **health banner** — one-glance ✅ / ⚠️ / ❌ verdict from success rate.
-- A **time-range selector** (7 / 30 / 90 days).
-- Metric cards, rows-synced-per-day, status breakdown, rows by DocType, live
-  ClickHouse table sizes, and recent runs.
+- **Health** — one verdict (Healthy / Attention / Action needed) with the
+  reason, and the ClickHouse connection state.
+- **Overall statistics** — DocTypes configured, source records (MariaDB),
+  warehouse records (ClickHouse, latest version, excluding soft-deleted),
+  pending records (changed since each DocType's last sync position), failed
+  records and runs, synchronized %, last successful sync.
+- **Live synchronization** — one card per queued or running sync: phase,
+  progress against the run's record count, records processed / written /
+  inserted / updated / re-checked / skipped / failed, batch number, cursor,
+  speed, elapsed time, estimated time remaining, retry attempt, and a Stop
+  button. Stalled runs (no progress for 10 minutes) are flagged.
+- **DocTypes** — per-DocType status, counts, difference, pending, synced %,
+  last success and failure, with Incremental / Full / Stop / Logs controls.
+- **Errors** — recent failed runs with category, batch, retries and failed
+  records; a full report (message, traceback, batch keys) per run; DocTypes
+  failing now with a retry button.
+- **Analytics** — records written per day, runs per day by outcome, warehouse
+  table sizes and recent runs, for 7 / 30 / 90 days.
+
+Where the numbers come from: live progress is written by the sync worker to
+Redis (`clickhouse_sync.clickhouse.live_status`) after every batch; counts
+come from MariaDB and ClickHouse and are cached for 10 minutes (menu →
+Recount Records forces a recount); history comes from ClickHouse Sync Log.
+The live monitor refreshes every 3 seconds while a sync is active and the
+page every 30 seconds. API: `clickhouse_sync.api.dashboard` (read endpoints
+accept GET; start/stop endpoints are POST-only).
+
+Live and last-run details live in the Redis cache, so a Redis restart clears
+them until the next run; Sync Logs are unaffected.
 
 ## Install
 

@@ -27,7 +27,17 @@ from typing import Any, Callable
 from unittest import mock
 
 _DT_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
-_DATETIME_COLUMNS = {"modified", "creation"}
+_DATETIME_COLUMNS = {"modified", "creation", "start_time", "end_time", "last_sync_timestamp", "queued_at"}
+
+LOG_TABLE_COLUMNS = [
+    "name", "creation", "configuration", "status", "trigger", "start_time", "end_time",
+    "duration", "rows_read", "rows_written", "rows_failed", "message", "exception",
+    "execution_host",
+]
+CONFIG_TABLE_COLUMNS = [
+    "name", "source_doctype", "enabled", "scheduler_enabled", "sync_mode",
+    "delete_strategy", "priority", "last_sync_timestamp",
+]
 
 
 def ensure_frappe_importable() -> None:
@@ -64,8 +74,11 @@ def _cint(value: Any) -> int:
 
 
 def _get_datetime(value: Any = None) -> Any:
+    """Like ``frappe.utils.get_datetime``: accepts any ISO-style string."""
     if isinstance(value, str):
-        return dt.datetime.strptime(value, _DT_FORMAT)
+        return dt.datetime.fromisoformat(value)
+    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
+        return dt.datetime.combine(value, dt.time())
     return value
 
 
@@ -101,6 +114,22 @@ class FakeDB:
         cols = ", ".join(f"`{c}`" for c in columns)
         self.conn.execute(f"CREATE TABLE `tab{doctype}` ({cols})")
 
+    def create_raw_table(self, table: str, columns: list[str]) -> None:
+        cols = ", ".join(f"`{c}`" for c in columns)
+        self.conn.execute(f"CREATE TABLE `{table}` ({cols})")
+
+    def has_table(self, table: str) -> bool:
+        cur = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+        return cur.fetchone() is not None
+
+    def insert_raw(self, table: str, **row: Any) -> None:
+        cols = ", ".join(f"`{c}`" for c in row)
+        marks = ", ".join("?" for _ in row)
+        self.conn.execute(
+            f"INSERT INTO `{table}` ({cols}) VALUES ({marks})",
+            [self._to_db(v) for v in row.values()],
+        )
+
     def upsert(self, doctype: str, **row: Any) -> None:
         self.conn.execute(f"DELETE FROM `tab{doctype}` WHERE name = ?", (row["name"],))
         cols = ", ".join(f"`{c}`" for c in row)
@@ -123,6 +152,10 @@ class FakeDB:
         if self.before_query:
             self.before_query(query, params)
         self.queries.append(query)
+        # MariaDB-only statement time limits: SQLite has no equivalent.
+        query = re.sub(r"^\s*SET STATEMENT max_statement_time=\d+ FOR\s+", "", query)
+        if "information_schema" in query:
+            raise sqlite3.OperationalError("information_schema is not available in tests")
         translated = re.sub(r"%\((\w+)\)s", r":\1", query)
         cur = self.conn.execute(translated, {k: self._to_db(v) for k, v in params.items()})
         fetched = cur.fetchall()
@@ -149,6 +182,12 @@ class FakeDB:
     def set_value(self, doctype: str, name: str, field: str, value: Any, **kwargs: Any) -> None:
         self.cursors[name] = value
         self.cursor_history.append(value)
+        table = f"tab{doctype}"
+        if field == "last_sync_timestamp" and self.has_table(table):
+            self.conn.execute(
+                f"UPDATE `{table}` SET last_sync_timestamp = ? WHERE name = ?",
+                (self._to_db(value), name),
+            )
 
     def commit(self) -> None:
         pass
@@ -167,7 +206,7 @@ class FakeDB:
         out = dict(row)
         for key in _DATETIME_COLUMNS & out.keys():
             if isinstance(out[key], str):
-                out[key] = dt.datetime.strptime(out[key], _DT_FORMAT)
+                out[key] = dt.datetime.fromisoformat(out[key])
         return out
 
 
@@ -197,6 +236,7 @@ class FakeClickHouse:
         self.commands: list[str] = []
         self.insert_log: list[tuple[str, int]] = []
         self.insert_attempts = 0
+        self.fail_queries = False
         # Called before each insert with (insert_number, table); raise to fail.
         self.on_insert: Callable[[int, str], None] | None = None
 
@@ -218,10 +258,28 @@ class FakeClickHouse:
 
     def command(self, sql: str) -> None:
         self.commands.append(sql)
+        match = re.search(r"CREATE TABLE IF NOT EXISTS `[^`]+`\.`([^`]+)`", sql)
+        if match:
+            self.tables.setdefault(match.group(1), {})
 
-    def query(self, sql: str, parameters: dict | None = None) -> Any:
+    def query(self, sql: str, parameters: dict | None = None, settings: dict | None = None) -> Any:
+        if self.fail_queries:
+            raise ConnectionRefusedError("connection refused")
         if "system.tables" in sql:
-            return types.SimpleNamespace(result_rows=[[1]])
+            table = (parameters or {}).get("tbl")
+            if table is None:
+                return types.SimpleNamespace(result_rows=[[1]])
+            return types.SimpleNamespace(result_rows=[[1 if table in self.tables else 0]])
+        if "FROM system.parts" in sql:
+            return types.SimpleNamespace(
+                result_rows=[[t, len(rows), 1000 * len(rows), 1] for t, rows in self.tables.items()]
+            )
+        match = re.search(r"SELECT count\(\) FROM `[^`]+`\.`([^`]+)` FINAL(.*)", sql)
+        if match:
+            rows = self.tables.get(match.group(1), {}).values()
+            if "_ch_is_deleted" in match.group(2):
+                rows = [r for r in rows if not r.get("_ch_is_deleted")]
+            return types.SimpleNamespace(result_rows=[[len(list(rows))]])
         if "system.columns" in sql:
             return types.SimpleNamespace(result_rows=[])
         if "SELECT DISTINCT `name`" in sql:
@@ -275,6 +333,10 @@ class FakeFrappe:
         self.metas: dict[str, FakeMeta] = {}
         self.configs: dict[str, Any] = {}
         self.logs: list[Any] = []
+        self.clock = clock
+        self.enqueued: list[dict[str, Any]] = []
+        self.role_checks: list[tuple] = []
+        self.deny_roles = False
         self.warnings: list[str] = []
         self._cache: dict[str, Any] = {}
         self.session = types.SimpleNamespace(user="Administrator")
@@ -297,9 +359,31 @@ class FakeFrappe:
         return list(self.db.rows(doctype))
 
     def new_doc(self, doctype: str) -> Any:
-        doc = types.SimpleNamespace(name=f"LOG-{len(self.logs) + 1}")
-        doc.insert = lambda **kwargs: self.logs.append(doc)
+        doc = types.SimpleNamespace(name=f"LOG-{len(self.logs) + 1:04d}")
+
+        def insert(**kwargs: Any) -> None:
+            self.logs.append(doc)
+            if self.db.has_table("tabClickHouse Sync Log"):
+                row = {c: getattr(doc, c, None) for c in LOG_TABLE_COLUMNS}
+                row["creation"] = self.clock()
+                self.db.insert_raw("tabClickHouse Sync Log", **row)
+
+        doc.insert = insert
         return doc
+
+    def enqueue(self, method: str, **kwargs: Any) -> None:
+        self.enqueued.append(kwargs)
+
+    def only_for(self, roles: Any, message: bool = False) -> None:
+        self.role_checks.append(tuple(roles) if not isinstance(roles, str) else (roles,))
+        if self.deny_roles:
+            raise PermissionError("Not permitted")
+
+    def throw(self, message: str, *args: Any, **kwargs: Any) -> None:
+        raise ValueError(message)
+
+    def whitelist(self, *args: Any, **kwargs: Any) -> Any:
+        return lambda fn: fn
 
     def cache(self) -> "FakeRedisCache":
         return FakeRedisCache(self._cache, self.local.cache)
@@ -323,7 +407,10 @@ class EngineHarness:
     DOCTYPE = "Doc"
 
     def __init__(self, testcase: Any, batch_size: int = 2) -> None:
-        from clickhouse_sync.clickhouse import alerts, connection, schema, sync_engine
+        from clickhouse_sync.api import dashboard
+        from clickhouse_sync.clickhouse import alerts, connection, live_status, schema, sync_engine
+
+        self.dashboard = dashboard
 
         self.engine = sync_engine
         self.clock = Clock()
@@ -334,7 +421,10 @@ class EngineHarness:
         self.batch_size = batch_size
 
         self.db.create_table(self.DOCTYPE, ["name", "modified", "title"])
+        self.db.create_raw_table("tabClickHouse Sync Log", LOG_TABLE_COLUMNS)
+        self.db.create_raw_table("tabClickHouse Sync Configuration", CONFIG_TABLE_COLUMNS)
         self.frappe.metas[self.DOCTYPE] = FakeMeta([docfield("title")])
+        self.job_active: bool | None = None
         self.set_config()
 
         schema._SCHEMA_CACHE.clear()
@@ -342,6 +432,15 @@ class EngineHarness:
             mock.patch.object(sync_engine, "frappe", self.frappe),
             mock.patch.object(schema, "frappe", self.frappe),
             mock.patch.object(alerts, "frappe", self.frappe),
+            mock.patch.object(live_status, "frappe", self.frappe),
+            mock.patch.object(dashboard, "frappe", self.frappe),
+            mock.patch.object(dashboard, "now_datetime", self.clock),
+            mock.patch.object(dashboard, "get_datetime", _get_datetime),
+            mock.patch.object(dashboard, "cint", _cint),
+            mock.patch.object(dashboard, "_", lambda text: text),
+            mock.patch.object(dashboard, "_job_active", lambda job_id: self.job_active),
+            mock.patch.object(live_status, "now_datetime", self.clock),
+            mock.patch.object(live_status, "get_datetime", _get_datetime),
             mock.patch.object(sync_engine, "now_datetime", self.clock),
             mock.patch.object(sync_engine, "get_datetime", _get_datetime),
             mock.patch.object(sync_engine, "cint", _cint),
@@ -373,7 +472,15 @@ class EngineHarness:
         values.update(overrides)
         config = types.SimpleNamespace(**values)
         config.get = lambda key, default=None: getattr(config, key, default)
-        self.frappe.configs[self.DOCTYPE] = config
+        self.frappe.configs[values["name"]] = config
+        self.db.conn.execute("DELETE FROM `tabClickHouse Sync Configuration` WHERE name = ?", (values["name"],))
+        self.db.insert_raw(
+            "tabClickHouse Sync Configuration",
+            name=values["name"], source_doctype=values["source_doctype"], enabled=values["enabled"],
+            scheduler_enabled=values.get("scheduler_enabled", 1), sync_mode=values["sync_mode"],
+            delete_strategy=values["delete_strategy"], priority=values.get("priority", 0),
+            last_sync_timestamp=self.db.cursors.get(values["name"]),
+        )
 
     def add_child_table(self, child_doctype: str = "Doc Item") -> str:
         self.db.create_table(child_doctype, ["name", "modified", "parent", "parenttype", "parentfield", "qty"])
@@ -384,7 +491,7 @@ class EngineHarness:
         return child_doctype
 
     # -- connection -------------------------------------------------------- #
-    def get_client(self, force_new: bool = False) -> FakeClickHouse:
+    def get_client(self, force_new: bool = False, retries: int | None = None) -> FakeClickHouse:
         self.connect_calls.append(force_new)
         if self.connect_error:
             error = self.connect_error(len(self.connect_calls))

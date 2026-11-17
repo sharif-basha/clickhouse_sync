@@ -171,12 +171,16 @@ def _is_alive(client: "Client") -> bool:
         return False
 
 
-def get_client(force_new: bool = False) -> "Client":
+def get_client(force_new: bool = False, retries: int | None = None) -> "Client":
     """Return a healthy ClickHouse client, using the process cache when possible.
 
     Args:
         force_new: When ``True`` the cache entry is discarded and a brand new
             client is built. Use this after a settings change or a hard error.
+        retries: Connection attempts before giving up. Defaults to
+            ``DEFAULT_CONNECT_RETRIES``. Interactive callers such as the
+            dashboard pass ``1`` so an outage is reported at once instead of
+            after the backoff sequence.
 
     Returns:
         A live ``clickhouse-connect`` client.
@@ -197,7 +201,9 @@ def get_client(force_new: bool = False) -> "Client":
             _close_silently(cached)
             _CLIENT_CACHE.pop(key, None)
 
-        client = _connect_with_retry(params)
+        client = _connect_with_retry(
+            params, retries=retries if retries is not None else DEFAULT_CONNECT_RETRIES
+        )
         _CLIENT_CACHE[key] = client
         return client
 

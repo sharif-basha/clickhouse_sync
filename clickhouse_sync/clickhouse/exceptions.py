@@ -218,3 +218,100 @@ def is_transient_error(exc: BaseException) -> bool:
     if any(marker in message for marker in TRANSIENT_ERROR_MARKERS):
         return True
     return bool(_HTTP_GATEWAY_RE.search(message))
+
+
+# --------------------------------------------------------------------------- #
+# Error categories (for the dashboard and reports)
+# --------------------------------------------------------------------------- #
+ERROR_CATEGORIES: tuple[str, ...] = (
+    "Connection",
+    "Timeout",
+    "Server capacity",
+    "Schema",
+    "Configuration",
+    "Data",
+    "ClickHouse error",
+    "Job timeout",
+    "Cancelled",
+    "Interrupted",
+    "Unexpected",
+)
+
+_CAPACITY_CODES = frozenset({202, 203, 241, 242, 252})
+_TIMEOUT_CODES = frozenset({159, 209})
+_CONNECTION_CODES = frozenset({198, 210, 225, 279, 999})
+
+
+def _category_for_code(code: int) -> str:
+    if code in _CAPACITY_CODES:
+        return "Server capacity"
+    if code in _TIMEOUT_CODES:
+        return "Timeout"
+    if code in _CONNECTION_CODES:
+        return "Connection"
+    if code in (16, 47, 53, 60, 81):  # unknown column/identifier/type, missing table/db
+        return "Schema"
+    if code in (6, 27, 38, 41, 69, 70, 72):  # value parse/convert errors
+        return "Data"
+    if code in (192, 193, 194, 195, 516):  # unknown user / wrong password / auth
+        return "Configuration"
+    return "ClickHouse error"
+
+
+def categorize_error(exc: BaseException) -> str:
+    """Return a short, stable category name for a sync failure."""
+    if isinstance(exc, SyncCancelledError):
+        return "Cancelled"
+    if is_job_timeout(exc):
+        return "Job timeout"
+    if isinstance(exc, ClickHouseConfigurationError):
+        return "Configuration"
+    if isinstance(exc, ClickHouseSchemaError):
+        return "Schema"
+    if isinstance(exc, ClickHouseConnectionError):
+        return "Connection"
+    code = clickhouse_error_code(exc)
+    if code is not None:
+        return _category_for_code(code)
+    if isinstance(exc, TimeoutError):
+        return "Timeout"
+    if isinstance(exc, _PERMANENT_EXCEPTION_TYPES):
+        return "Data"
+    if is_transient_error(exc):
+        return "Connection"
+    return "Unexpected"
+
+
+_TRACEBACK_CLASS_RE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Timeout\w*|Exit))\b", re.MULTILINE)
+
+
+def categorize_text(message: str | None, exception_text: str | None = None) -> str:
+    """Best-effort category for a stored Sync Log (message + traceback text).
+
+    Used for logs written before categories were recorded alongside runs.
+    """
+    text = f"{exception_text or ''}\n{message or ''}"
+    if "Sync cancelled" in text or "SyncCancelledError" in text:
+        return "Cancelled"
+    if "Sync interrupted" in text:
+        return "Interrupted"
+    if "JobTimeoutException" in text or "maximum timeout value" in text:
+        return "Job timeout"
+    match = _CLICKHOUSE_CODE_RE.search(text)
+    if match:
+        return _category_for_code(int(match.group(1)))
+    names = {m.split(".")[-1] for m in _TRACEBACK_CLASS_RE.findall(text)}
+    if "ClickHouseConfigurationError" in names or "is disabled" in text:
+        return "Configuration"
+    if "ClickHouseSchemaError" in names:
+        return "Schema"
+    if "ClickHouseConnectionError" in names or names & {"ConnectionError", "ConnectionResetError", "ConnectionRefusedError", "OperationalError"}:
+        return "Connection"
+    if names & {"TimeoutError", "ReadTimeout", "ConnectTimeout"}:
+        return "Timeout"
+    if names & {"ValueError", "TypeError", "KeyError", "IndexError", "AttributeError", "ZeroDivisionError", "OverflowError"}:
+        return "Data"
+    lowered = text.lower()
+    if any(marker in lowered for marker in TRANSIENT_ERROR_MARKERS):
+        return "Connection"
+    return "Unexpected"
