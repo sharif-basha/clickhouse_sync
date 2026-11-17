@@ -572,6 +572,10 @@ def overview(days: int = 7) -> dict[str, Any]:
     enabled = [d for d in doctypes if d["enabled"]]
     failed_doctypes = [d["configuration"] for d in enabled if d["last_status"] == "Failed"]
 
+    # Fetch table sizes (which also connects, if the counts above all came
+    # from the cache) BEFORE reporting the connection state.
+    warehouse_tables = _warehouse_tables(warehouse)
+
     overall = {
         "configured": len(doctypes),
         "enabled": len(enabled),
@@ -605,7 +609,7 @@ def overview(days: int = 7) -> dict[str, Any]:
         "doctypes": doctypes,
         "errors": errors,
         "analytics": analytics,
-        "warehouse_tables": _warehouse_tables(warehouse),
+        "warehouse_tables": warehouse_tables,
     }
 
 

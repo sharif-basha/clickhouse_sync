@@ -189,6 +189,13 @@ class TestOverview(DashboardTestCase):
         self.assertEqual(row["source"], 5)  # source count comes from the cache
         self.assertEqual(row["sync_percent"], 60.0)
 
+    def test_connection_state_is_reported_when_counts_come_from_cache(self) -> None:
+        self.h.seed(3)
+        self.h.run()
+        self.overview()  # fills the count cache
+        data = self.overview()  # every count now cached
+        self.assertTrue(data["clickhouse"]["ok"])
+
     def test_recount_bypasses_the_cache(self) -> None:
         self.h.seed(3)
         self.h.run()
