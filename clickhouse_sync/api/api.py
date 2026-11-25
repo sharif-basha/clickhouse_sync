@@ -49,7 +49,7 @@ def test_connection() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Sync control
 # --------------------------------------------------------------------------- #
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def sync_now(configuration: str, trigger: str = "Manual") -> dict[str, Any]:
     """Enqueue a background sync for a single configuration.
 
@@ -75,7 +75,7 @@ def sync_now(configuration: str, trigger: str = "Manual") -> dict[str, Any]:
     return {"queued": True, "job_id": job_id, "configuration": configuration}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def sync_all(trigger: str = "Manual") -> dict[str, Any]:
     """Enqueue syncs for every enabled configuration, in priority order."""
     _guard()
@@ -102,7 +102,7 @@ def sync_all(trigger: str = "Manual") -> dict[str, Any]:
     return {"queued": queued, "count": len(queued)}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def cancel_sync(configuration: str) -> dict[str, Any]:
     """Request cancellation of a running sync for a configuration."""
     _guard()

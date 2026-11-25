@@ -25,10 +25,23 @@ from clickhouse_sync.tests._fakes import EngineHarness, ensure_frappe_importable
 
 ensure_frappe_importable()
 
+from clickhouse_sync.api import api as whitelist_api  # noqa: E402
 from clickhouse_sync.clickhouse import alerts, sync_engine  # noqa: E402
 from clickhouse_sync.clickhouse.exceptions import ClickHouseConnectionError  # noqa: E402
 
 LAG = sync_engine.CURSOR_SAFETY_LAG_SECONDS
+
+
+class TestWhitelistedApiMethods(unittest.TestCase):
+    def test_state_changing_endpoints_are_post_only(self) -> None:
+        for endpoint in (whitelist_api.sync_now, whitelist_api.sync_all, whitelist_api.cancel_sync):
+            with self.subTest(endpoint=endpoint.__name__):
+                self.assertEqual(endpoint.allowed_http_methods, ["POST"])
+
+    def test_read_only_endpoints_keep_default_methods(self) -> None:
+        for endpoint in (whitelist_api.test_connection, whitelist_api.get_progress):
+            with self.subTest(endpoint=endpoint.__name__):
+                self.assertIsNone(endpoint.allowed_http_methods)
 
 
 def fail_on_insert(number: int, error: Exception, table: str | None = None):
@@ -389,6 +402,91 @@ class TestChildTables(unittest.TestCase):
         self.h.clock.advance(20)
         self.assertEqual(self.h.run().status, "Completed")
         self.assertIn("row-new", self.h.warehouse("tab_doc_item"))
+
+    def test_incremental_child_pages_share_parent_watermark_and_keyset(self) -> None:
+        self.assertEqual(self.h.run().status, "Completed")
+        child_queries = [
+            (query, params)
+            for query, params in self.h.db.query_log
+            if "FROM `tabDoc Item`" in query
+        ]
+        self.assertTrue(child_queries)
+        query, params = child_queries[0]
+        self.assertIn("modified <= %(upper)s", query)
+        self.assertIn("ORDER BY modified ASC, name ASC", query)
+        parent_watermarks = [
+            params["upper"]
+            for query, params in self.h.db.query_log
+            if "ORDER BY modified ASC, name ASC" in query
+            and "FROM `tabDoc`" in query
+        ]
+        self.assertIn(params["upper"], parent_watermarks)
+
+    def test_child_edit_after_its_batch_is_read_is_picked_up_next_run(self) -> None:
+        self.assertEqual(self.h.run().status, "Completed")
+        self.h.clock.advance(LAG * 2)
+        first_insert = self.h.clickhouse.insert_attempts + 1
+
+        def edit_child_during_insert(n: int, table: str) -> None:
+            if table == "tab_doc_item" and n == first_insert:
+                modified = self.h.clock.advance(1)
+                self.h.db.upsert(
+                    self.child, name="row-0", modified=modified,
+                    parent="DOC-00", parenttype=self.h.DOCTYPE, parentfield="items", qty=99,
+                )
+
+        self.h.clickhouse.on_insert = edit_child_during_insert
+        self.assertEqual(self.h.run().status, "Completed")
+        self.h.clickhouse.on_insert = None
+        self.assertNotEqual(self.h.warehouse("tab_doc_item")["row-0"]["qty"], 99)
+
+        self.h.clock.advance(1)
+        self.assertEqual(self.h.run().status, "Completed")
+        self.assertEqual(self.h.warehouse("tab_doc_item")["row-0"]["qty"], 99)
+
+    def test_removed_and_reparented_child_rows_are_reconciled(self) -> None:
+        self.h.set_config(sync_child_tables=1, delete_strategy="Hard Delete")
+        self.assertEqual(self.h.run().status, "Completed")
+        self.h.db.delete(self.child, "row-0")
+        self.h.db.upsert(
+            self.child, name="row-1", modified=self.h.clock.advance(1),
+            parent="DOC-02", parenttype="Other DocType", parentfield="items", qty=1,
+        )
+        self.h.db.upsert(
+            self.child, name="row-2", modified=self.h.clock.advance(1),
+            parent="DOC-02", parenttype=self.h.DOCTYPE, parentfield="items", qty=2,
+        )
+
+        self.assertEqual(self.h.run().status, "Completed")
+        rows = self.h.warehouse("tab_doc_item")
+        self.assertNotIn("row-0", rows)
+        self.assertNotIn("row-1", rows)
+        self.assertEqual(rows["row-2"]["parent"], "DOC-02")
+
+
+class TestParameterizedDeleteNames(unittest.TestCase):
+    def test_quotes_and_backslashes_are_bound_for_delete_paths(self) -> None:
+        h = EngineHarness(self)
+        h.set_config(delete_strategy="Hard Delete", sync_mode="Full")
+        name = "quote' and slash\\name"
+        h.save(name)
+        self.assertEqual(h.run().status, "Completed")
+        h.db.delete(h.DOCTYPE, name)
+        self.assertEqual(h.run().status, "Completed")
+        self.assertNotIn(name, h.warehouse())
+        reconcile_call = next(
+            (sql, params)
+            for sql, params in h.clickhouse.command_calls
+            if "DELETE FROM" in sql and params.get("names") == [name]
+        )
+        self.assertIn("{names:Array(String)}", reconcile_call[0])
+
+        h.clickhouse.tables["tab_doc"][name] = {"name": name, "_ch_is_deleted": 0}
+        sync_engine.propagate_delete(h.DOCTYPE, name)
+        propagation_call = h.clickhouse.command_calls[-1]
+        self.assertIn("{name:String}", propagation_call[0])
+        self.assertEqual(propagation_call[1], {"name": name})
+        self.assertNotIn(name, h.warehouse())
 
 
 class TestRetryAndLogging(unittest.TestCase):
