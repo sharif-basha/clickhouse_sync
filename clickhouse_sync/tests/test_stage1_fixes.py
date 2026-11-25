@@ -463,6 +463,54 @@ class TestChildTables(unittest.TestCase):
         self.assertNotIn("row-1", rows)
         self.assertEqual(rows["row-2"]["parent"], "DOC-02")
 
+    def test_reconciling_shared_child_preserves_other_parent_rows(self) -> None:
+        other_parent = "Other DocType"
+        self.h.set_config(sync_child_tables=1, delete_strategy="Hard Delete")
+        self.h.db.create_table(other_parent, ["name", "modified", "title"])
+        self.h.frappe.metas[other_parent] = self.h.frappe.metas[self.h.DOCTYPE]
+        self.h.set_config(
+            name=other_parent,
+            source_doctype=other_parent,
+            sync_child_tables=1,
+            delete_strategy="Hard Delete",
+        )
+        self.h.db.upsert(
+            self.child, name="deleted-for-doc", modified=self.h.clock.now,
+            parent="DOC-00", parenttype=self.h.DOCTYPE, parentfield="items", qty=10,
+        )
+        self.h.db.upsert(
+            self.child, name="reparented-for-doc", modified=self.h.clock.now,
+            parent="DOC-00", parenttype=self.h.DOCTYPE, parentfield="items", qty=20,
+        )
+        self.h.db.upsert(
+            self.child, name="other-parent-row", modified=self.h.clock.now,
+            parent="OTHER-00", parenttype=other_parent, parentfield="items", qty=30,
+        )
+        self.h.clock.advance(5)
+
+        self.assertEqual(self.h.run().status, "Completed")
+        self.assertEqual(self.h.engine.run_sync(other_parent).status, "Completed")
+        self.h.db.delete(self.child, "deleted-for-doc")
+        self.h.db.upsert(
+            self.child, name="reparented-for-doc", modified=self.h.clock.advance(1),
+            parent="OTHER-00", parenttype=other_parent, parentfield="items", qty=20,
+        )
+
+        self.assertEqual(self.h.run().status, "Completed")
+        rows = self.h.warehouse("tab_doc_item")
+        self.assertNotIn("deleted-for-doc", rows)
+        self.assertNotIn("reparented-for-doc", rows)
+        self.assertIn("other-parent-row", rows)
+        reconcile_calls = [
+            (sql, params)
+            for sql, params in self.h.clickhouse.command_calls
+            if "DELETE FROM `wh`.`tab_doc_item`" in sql
+        ]
+        self.assertTrue(reconcile_calls)
+        self.assertTrue(
+            all(call[1]["source_parenttype"] == self.h.DOCTYPE for call in reconcile_calls)
+        )
+
 
 class TestParameterizedDeleteNames(unittest.TestCase):
     def test_quotes_and_backslashes_are_bound_for_delete_paths(self) -> None:

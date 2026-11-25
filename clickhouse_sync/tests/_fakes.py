@@ -298,6 +298,12 @@ class FakeClickHouse:
         names = params.get("names")
         if names is None:
             names = [params.get("name")]
+        parenttype = params.get("source_parenttype")
+        if parenttype is not None:
+            names = [
+                name for name in names
+                if name in table and table[name].get("parenttype") == parenttype
+            ]
         if "UPDATE `_ch_is_deleted` = 1" in sql:
             for name in names:
                 if name in table:
@@ -321,8 +327,12 @@ class FakeClickHouse:
         if "ORDER BY `name` ASC LIMIT {limit:UInt32}" in sql:
             table = sql.split("`.`")[1].split("`")[0]
             params = parameters or {}
+            parenttype = params.get("source_parenttype")
             names = sorted(
-                name for name in self.tables.get(table, {}) if name > params.get("last_name", "")
+                name
+                for name, row in self.tables.get(table, {}).items()
+                if name > params.get("last_name", "")
+                and (parenttype is None or row.get("parenttype") == parenttype)
             )
             names = names[: params.get("limit", len(names))]
             return types.SimpleNamespace(result_rows=[[name] for name in names])
