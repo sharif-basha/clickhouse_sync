@@ -637,11 +637,19 @@ def _reconcile_missing_rows(
     last_name = ""
 
     while True:
+        clickhouse_conditions = ["`name` > {last_name:String}"]
+        query_parameters: dict[str, Any] = {
+            "last_name": last_name,
+            "limit": DELETE_RECONCILE_BATCH_SIZE,
+        }
+        if source_parenttype is not None:
+            clickhouse_conditions.append("`parenttype` = {source_parenttype:String}")
+            query_parameters["source_parenttype"] = source_parenttype
         result = client.query(
             f"SELECT DISTINCT `name` FROM `{database}`.`{table_name}` "
-            "WHERE `name` > {last_name:String} "
+            f"WHERE {' AND '.join(clickhouse_conditions)} "
             "ORDER BY `name` ASC LIMIT {limit:UInt32}",
-            parameters={"last_name": last_name, "limit": DELETE_RECONCILE_BATCH_SIZE},
+            parameters=query_parameters,
         )
         names = [row[0] for row in result.result_rows]
         if not names:
@@ -667,18 +675,25 @@ def _reconcile_missing_rows(
         if not vanished:
             continue
 
+        mutation_conditions = []
+        mutation_parameters: dict[str, Any] = {"names": vanished}
+        if source_parenttype is not None:
+            mutation_conditions.append("`parenttype` = {source_parenttype:String}")
+            mutation_parameters["source_parenttype"] = source_parenttype
+        mutation_conditions.append("`name` IN {names:Array(String)}")
+        mutation_where = " AND ".join(mutation_conditions)
         if strategy == "Soft Delete":
             client.command(
                 f"ALTER TABLE `{database}`.`{table_name}` "
                 f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 "
-                "WHERE `name` IN {names:Array(String)}",
-                parameters={"names": vanished},
+                f"WHERE {mutation_where}",
+                parameters=mutation_parameters,
             )
         elif strategy == "Hard Delete":
             client.command(
                 f"DELETE FROM `{database}`.`{table_name}` "
-                "WHERE `name` IN {names:Array(String)}",
-                parameters={"names": vanished},
+                f"WHERE {mutation_where}",
+                parameters=mutation_parameters,
             )
         affected += len(vanished)
 
