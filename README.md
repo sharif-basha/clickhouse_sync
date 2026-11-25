@@ -4,7 +4,7 @@ Copy ERPNext / Frappe DocTypes from MariaDB into [ClickHouse](https://clickhouse
 for fast analytical queries, with incremental and full sync, resumable runs,
 retries, delete handling, Telegram alerts and a live monitoring dashboard.
 
-Built for RySS (Rythu Sadhikara Samstha) / APCNF to move operational data out of
+Built for organisation to move operational data out of
 MariaDB into a columnar warehouse that Superset and the `ai_insights` app can
 query without loading the production database.
 
