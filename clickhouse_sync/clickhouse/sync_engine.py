@@ -590,8 +590,7 @@ def _insert_batch(
 def reconcile_deletes(client: "Client", ctx: SyncContext, database: str) -> int:
     """Apply the configured delete strategy for rows removed from the source.
 
-    Compares the set of ``name`` values present in ClickHouse against the
-    source and:
+    Compares names in bounded ClickHouse pages against the source and:
 
     * **Soft Delete** - marks vanished rows with ``_ch_is_deleted = 1``.
     * **Hard Delete** - issues a lightweight ``DELETE`` for vanished rows.
@@ -601,7 +600,7 @@ def reconcile_deletes(client: "Client", ctx: SyncContext, database: str) -> int:
     ``reconcile_deletes_incremental`` enabled. This is the reliable safety net
     for deletions that the real-time ``on_trash`` hook can miss (rows deleted
     while a sync was down, bulk/direct-DB deletes). It performs a full
-    ``name``-set comparison, so it is opt-in for incremental to avoid that scan
+    full name comparison, so it is opt-in for incremental to avoid that scan
     cost on every scheduled tick.
 
     Returns:
@@ -612,43 +611,81 @@ def reconcile_deletes(client: "Client", ctx: SyncContext, database: str) -> int:
     if ctx.sync_mode != "Full" and not ctx.reconcile_deletes_incremental:
         return 0
 
-    source_names: set[str] = set(
-        frappe.get_all(ctx.doctype, pluck="name", limit_page_length=0)
+    return _reconcile_missing_rows(
+        client,
+        ctx.doctype,
+        ctx.table_name,
+        database,
+        ctx.delete_strategy,
     )
 
-    result = client.query(
-        f"SELECT DISTINCT `name` FROM `{database}`.`{ctx.table_name}`"
-    )
-    ch_names: set[str] = {row[0] for row in result.result_rows}
 
-    vanished = list(ch_names - source_names)
-    if not vanished:
-        return 0
+DELETE_RECONCILE_BATCH_SIZE = 1000
 
+
+def _reconcile_missing_rows(
+    client: "Client",
+    source_doctype: str,
+    table_name: str,
+    database: str,
+    strategy: str,
+    *,
+    source_parenttype: str | None = None,
+) -> int:
+    """Reconcile deleted or reparented rows with bounded, parameterized batches."""
     affected = 0
-    # Chunk to keep the IN() list and query size bounded.
-    for start in range(0, len(vanished), 10000):
-        chunk = vanished[start : start + 10000]
-        placeholders = ", ".join(f"'{_escape(n)}'" for n in chunk)
-        if ctx.delete_strategy == "Soft Delete":
+    last_name = ""
+
+    while True:
+        result = client.query(
+            f"SELECT DISTINCT `name` FROM `{database}`.`{table_name}` "
+            "WHERE `name` > {last_name:String} "
+            "ORDER BY `name` ASC LIMIT {limit:UInt32}",
+            parameters={"last_name": last_name, "limit": DELETE_RECONCILE_BATCH_SIZE},
+        )
+        names = [row[0] for row in result.result_rows]
+        if not names:
+            break
+        last_name = names[-1]
+
+        placeholders = ", ".join(f"%(name_{index})s" for index in range(len(names)))
+        source_conditions = [f"name IN ({placeholders})"]
+        params: dict[str, Any] = {
+            f"name_{index}": name for index, name in enumerate(names)
+        }
+        if source_parenttype is not None:
+            source_conditions.append("parenttype = %(parenttype)s")
+            params["parenttype"] = source_parenttype
+        rows = frappe.db.sql(
+            f"SELECT name FROM `tab{source_doctype}` "
+            f"WHERE {' AND '.join(source_conditions)}",
+            params,
+            as_dict=True,
+        )
+        live_names = {row["name"] for row in rows}
+        vanished = [name for name in names if name not in live_names]
+        if not vanished:
+            continue
+
+        if strategy == "Soft Delete":
             client.command(
-                f"ALTER TABLE `{database}`.`{ctx.table_name}` "
+                f"ALTER TABLE `{database}`.`{table_name}` "
                 f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 "
-                f"WHERE `name` IN ({placeholders})"
+                "WHERE `name` IN {names:Array(String)}",
+                parameters={"names": vanished},
             )
-        elif ctx.delete_strategy == "Hard Delete":
+        elif strategy == "Hard Delete":
             client.command(
-                f"DELETE FROM `{database}`.`{ctx.table_name}` "
-                f"WHERE `name` IN ({placeholders})"
+                f"DELETE FROM `{database}`.`{table_name}` "
+                "WHERE `name` IN {names:Array(String)}",
+                parameters={"names": vanished},
             )
-        affected += len(chunk)
+        affected += len(vanished)
+
+        if len(names) < DELETE_RECONCILE_BATCH_SIZE:
+            break
 
     return affected
-
-
-def _escape(value: str) -> str:
-    """Minimal single-quote escaping for identifiers used in IN() lists."""
-    return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
 # --------------------------------------------------------------------------- #
@@ -910,7 +947,12 @@ def _sync_one_child(
     database: str,
     synced_at: datetime,
 ) -> int:
-    """Sync a single child DocType filtered to the parent DocType's rows."""
+    """Sync one child DocType within the parent's watermark and cursor window.
+
+    Incremental reads keyset-page by ``(modified, name)``. Afterward, bounded
+    reconciliation removes or marks child rows that were deleted or moved to
+    another parent DocType.
+    """
     child_schema = build_table_schema(
         child_doctype,
         include_soft_delete=(ctx.delete_strategy == "Soft Delete"),
@@ -931,28 +973,33 @@ def _sync_one_child(
     col_sql = ", ".join(f"`{c}`" for c in fields)
     src_table = f"`tab{child_doctype}`"
     written = 0
-    last_name = ""
-
-    # Same window start as the parent (saved cursor minus the safety lag).
-    # Child rows are read all-or-nothing per run and the shared cursor only
-    # moves after they succeed, so primary-key paging is safe here.
     lower = incremental_lower_bound(ctx)
+    position: tuple[datetime, Any] | None = None
 
     while True:
-        conditions = ["parenttype = %(ptype)s", "name > %(last)s"]
-        params: dict[str, Any] = {
-            "ptype": ctx.doctype,
-            "last": last_name,
-            "limit": ctx.batch_size,
-        }
-        if lower is not None:
-            conditions.append("modified >= %(cursor)s")
-            params["cursor"] = lower
+        conditions = ["parenttype = %(ptype)s"]
+        params: dict[str, Any] = {"ptype": ctx.doctype, "limit": ctx.batch_size}
+        if ctx.sync_mode == "Incremental":
+            conditions.append("modified <= %(upper)s")
+            params["upper"] = synced_at
+            if position is not None:
+                conditions.append(
+                    "(modified > %(pos_modified)s "
+                    "OR (modified = %(pos_modified)s AND name > %(pos_name)s))"
+                )
+                params["pos_modified"], params["pos_name"] = position
+            elif lower is not None:
+                conditions.append("modified >= %(lower)s")
+                params["lower"] = lower
+            order_by = "modified ASC, name ASC"
+        else:
+            conditions.append("name > %(last_name)s")
+            params["last_name"] = position[1] if position is not None else ""
+            order_by = "name ASC"
 
-        where = " AND ".join(conditions)
         rows: list[dict[str, Any]] = frappe.db.sql(
-            f"SELECT {col_sql} FROM {src_table} WHERE {where} "
-            f"ORDER BY name ASC LIMIT %(limit)s",
+            f"SELECT {col_sql} FROM {src_table} WHERE {' AND '.join(conditions)} "
+            f"ORDER BY {order_by} LIMIT %(limit)s",
             params,
             as_dict=True,
         )
@@ -967,9 +1014,23 @@ def _sync_one_child(
             database=database,
         )
         written += len(data)
-        last_name = rows[-1]["name"]
+        position = (
+            (get_datetime(rows[-1]["modified"]), rows[-1]["name"])
+            if ctx.sync_mode == "Incremental"
+            else (synced_at, rows[-1]["name"])
+        )
         if len(rows) < ctx.batch_size:
             break
+
+    if ctx.delete_strategy != "Ignore":
+        _reconcile_missing_rows(
+            client,
+            child_doctype,
+            child_schema.table_name,
+            database,
+            ctx.delete_strategy,
+            source_parenttype=ctx.doctype,
+        )
 
     if written and ctx.optimize_after_sync and (
         ctx.sync_mode == "Full" or not ctx.optimize_only_on_full
@@ -1174,15 +1235,17 @@ def propagate_delete(doctype: str, docname: str) -> None:
         client = ch_connection.get_client()
         database = ch_connection.get_connection_params().database
         table = table_name_for(doctype)
-        escaped = _escape(docname)
         if strategy == "Soft Delete":
             client.command(
                 f"ALTER TABLE `{database}`.`{table}` "
-                f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 WHERE `name` = '{escaped}'"
+                f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 "
+                "WHERE `name` = {name:String}",
+                parameters={"name": docname},
             )
         elif strategy == "Hard Delete":
             client.command(
-                f"DELETE FROM `{database}`.`{table}` WHERE `name` = '{escaped}'"
+                f"DELETE FROM `{database}`.`{table}` WHERE `name` = {{name:String}}",
+                parameters={"name": docname},
             )
     except Exception as exc:  # noqa: BLE001 - never block the Frappe delete
         frappe.logger("clickhouse_sync").warning(

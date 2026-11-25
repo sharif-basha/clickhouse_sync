@@ -59,7 +59,15 @@ def ensure_frappe_importable() -> None:
     utils_stub.get_datetime = _get_datetime
     utils_stub.now_datetime = dt.datetime.now
     frappe_stub.utils = utils_stub
-    frappe_stub.whitelist = lambda *a, **k: (lambda fn: fn)
+    def whitelist(*args: Any, **kwargs: Any) -> Any:
+        def decorate(fn: Any) -> Any:
+            fn.is_whitelisted = True
+            fn.allowed_http_methods = kwargs.get("methods")
+            return fn
+
+        return decorate
+
+    frappe_stub.whitelist = whitelist
     frappe_stub.only_for = lambda *a, **k: None
     frappe_stub._ = lambda s: s
     sys.modules["frappe"] = frappe_stub
@@ -105,6 +113,7 @@ class FakeDB:
         self.cursors: dict[str, Any] = {}
         self.cursor_history: list[Any] = []
         self.queries: list[str] = []
+        self.query_log: list[tuple[str, dict[str, Any]]] = []
         self.before_query: Callable[[str, dict], None] | None = None
 
     # -- table helpers ----------------------------------------------------- #
@@ -152,6 +161,7 @@ class FakeDB:
         if self.before_query:
             self.before_query(query, params)
         self.queries.append(query)
+        self.query_log.append((query, params))
         # MariaDB-only statement time limits: SQLite has no equivalent.
         query = re.sub(r"^\s*SET STATEMENT max_statement_time=\d+ FOR\s+", "", query)
         if "information_schema" in query:
@@ -192,8 +202,24 @@ class FakeDB:
     def commit(self) -> None:
         pass
 
-    def get_value(self, *args: Any, **kwargs: Any) -> None:
-        return None
+    def get_value(self, *args: Any, **kwargs: Any) -> Any:
+        if not args:
+            return None
+        doctype = args[0]
+        filters = args[1] if len(args) > 1 else None
+        fieldname = args[2] if len(args) > 2 else kwargs.get("fieldname")
+        if doctype != "ClickHouse Sync Configuration" or not fieldname:
+            return None
+        if isinstance(filters, dict):
+            where = " AND ".join(f"`{field}` = ?" for field in filters)
+            values = tuple(filters.values())
+        else:
+            where, values = "`name` = ?", (filters,)
+        row = self.conn.execute(
+            f"SELECT `{fieldname}` FROM `tabClickHouse Sync Configuration` WHERE {where}",
+            values,
+        ).fetchone()
+        return row[0] if row else None
 
     @staticmethod
     def _to_db(value: Any) -> Any:
@@ -234,6 +260,7 @@ class FakeClickHouse:
     def __init__(self) -> None:
         self.tables: dict[str, dict[str, dict[str, Any]]] = {}
         self.commands: list[str] = []
+        self.command_calls: list[tuple[str, dict[str, Any]]] = []
         self.insert_log: list[tuple[str, int]] = []
         self.insert_attempts = 0
         self.fail_queries = False
@@ -256,11 +283,28 @@ class FakeClickHouse:
         for row in data:
             target[row[key]] = dict(zip(column_names, row))
 
-    def command(self, sql: str) -> None:
+    def command(self, sql: str, parameters: dict | None = None) -> None:
         self.commands.append(sql)
+        params = dict(parameters or {})
+        self.command_calls.append((sql, params))
         match = re.search(r"CREATE TABLE IF NOT EXISTS `[^`]+`\.`([^`]+)`", sql)
         if match:
             self.tables.setdefault(match.group(1), {})
+            return
+        match = re.search(r"(?:ALTER TABLE|DELETE FROM) `[^`]+`\.`([^`]+)`", sql)
+        if not match:
+            return
+        table = self.tables.get(match.group(1), {})
+        names = params.get("names")
+        if names is None:
+            names = [params.get("name")]
+        if "UPDATE `_ch_is_deleted` = 1" in sql:
+            for name in names:
+                if name in table:
+                    table[name]["_ch_is_deleted"] = 1
+        else:
+            for name in names:
+                table.pop(name, None)
 
     def query(self, sql: str, parameters: dict | None = None, settings: dict | None = None) -> Any:
         if self.fail_queries:
@@ -274,6 +318,14 @@ class FakeClickHouse:
             return types.SimpleNamespace(
                 result_rows=[[t, len(rows), 1000 * len(rows), 1] for t, rows in self.tables.items()]
             )
+        if "ORDER BY `name` ASC LIMIT {limit:UInt32}" in sql:
+            table = sql.split("`.`")[1].split("`")[0]
+            params = parameters or {}
+            names = sorted(
+                name for name in self.tables.get(table, {}) if name > params.get("last_name", "")
+            )
+            names = names[: params.get("limit", len(names))]
+            return types.SimpleNamespace(result_rows=[[name] for name in names])
         match = re.search(r"SELECT count\(\) FROM `[^`]+`\.`([^`]+)` FINAL(.*)", sql)
         if match:
             rows = self.tables.get(match.group(1), {}).values()
@@ -383,7 +435,12 @@ class FakeFrappe:
         raise ValueError(message)
 
     def whitelist(self, *args: Any, **kwargs: Any) -> Any:
-        return lambda fn: fn
+        def decorate(fn: Any) -> Any:
+            fn.is_whitelisted = True
+            fn.allowed_http_methods = kwargs.get("methods")
+            return fn
+
+        return decorate
 
     def cache(self) -> "FakeRedisCache":
         return FakeRedisCache(self._cache, self.local.cache)
