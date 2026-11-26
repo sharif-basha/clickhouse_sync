@@ -11,8 +11,13 @@ Every endpoint here is:
 * **Side-effect aware** - anything that launches work uses
   :func:`frappe.enqueue` so HTTP requests return immediately.
 
-These are the endpoints referenced by the client scripts and by the workspace
-dashboard, and they double as a stable programmatic interface.
+These are the endpoints referenced by the desk-wide client script
+(``public/js/clickhouse_sync.js``), the configuration form, the workspace
+number cards and other apps, so their names and response shapes are kept
+stable. The monitoring dashboard uses :mod:`clickhouse_sync.api.dashboard`;
+where both need the same data, the logic lives in one place
+(:mod:`clickhouse_sync.tasks`, :mod:`clickhouse_sync.clickhouse.warehouse_stats`,
+:mod:`clickhouse_sync.api.dashboard`) and this module only adapts the shape.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from clickhouse_sync.clickhouse import connection as ch_connection
 from clickhouse_sync.clickhouse import live_status
 from clickhouse_sync.clickhouse import schema as ch_schema
 from clickhouse_sync.clickhouse import sync_engine
+from clickhouse_sync.clickhouse.warehouse_stats import readable_size, table_sizes
 from clickhouse_sync.tasks import enqueue_config_sync
 
 ALLOWED_ROLES = ("System Manager", "ClickHouse Sync Manager")
@@ -186,23 +192,9 @@ def table_status() -> list[dict[str, Any]]:
     _guard()
     client = ch_connection.get_client()
     database = ch_connection.get_connection_params().database
-    result = client.query(
-        """
-        SELECT
-            table,
-            sum(rows) AS rows,
-            formatReadableSize(sum(bytes_on_disk)) AS size,
-            sum(bytes_on_disk) AS bytes
-        FROM system.parts
-        WHERE database = {db:String} AND active
-        GROUP BY table
-        ORDER BY bytes DESC
-        """,
-        parameters={"db": database},
-    )
     return [
-        {"table": row[0], "rows": row[1], "size": row[2], "bytes": row[3]}
-        for row in result.result_rows
+        {"table": t["table"], "rows": t["rows"], "size": readable_size(t["bytes"]), "bytes": t["bytes"]}
+        for t in table_sizes(client, database)
     ]
 
 
@@ -211,7 +203,7 @@ def table_status() -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 @frappe.whitelist()
 def dashboard() -> dict[str, Any]:
-    """Return the aggregate metrics rendered on the workspace dashboard."""
+    """Deprecated alias of :func:`statistics`, kept for existing callers."""
     _guard()
     return statistics()
 
@@ -329,21 +321,13 @@ def analytics(days: int = 30) -> dict[str, Any]:
     }
 
     # --- Rows synced per day (time series) --------------------------------- #
-    rows_per_day_raw = frappe.db.sql(
-        """
-        SELECT DATE(creation) AS day, COALESCE(SUM(rows_written), 0) AS rows_written
-        FROM `tabClickHouse Sync Log`
-        WHERE creation >= DATE_SUB(CURDATE(), INTERVAL %(days)s DAY)
-        GROUP BY DATE(creation)
-        ORDER BY day ASC
-        """,
-        {"days": window},
-        as_dict=True,
-    )
-    rows_per_day = {
-        "labels": [str(r["day"]) for r in rows_per_day_raw],
-        "values": [int(r["rows_written"]) for r in rows_per_day_raw],
-    }
+    # Same per-day series as the monitoring dashboard (one implementation),
+    # including days with no runs.
+    from clickhouse_sync.api import dashboard as monitoring
+
+    since = add_days(getdate(frappe.utils.today()), -window)
+    series = monitoring._analytics(get_datetime(since), window)
+    rows_per_day = {"labels": series["labels"], "values": series["rows_written"]}
 
     # --- Status breakdown -------------------------------------------------- #
     status_raw = frappe.db.sql(

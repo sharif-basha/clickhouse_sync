@@ -359,3 +359,67 @@ def empty_value_for(clickhouse_type: str) -> Any:
     if base.startswith("Date"):
         return _dt.date(1970, 1, 1)
     return ""
+
+
+# --------------------------------------------------------------------------- #
+# Time zones
+# --------------------------------------------------------------------------- #
+# ``clickhouse-connect`` turns a NAIVE datetime into an epoch with
+# ``datetime.timestamp()``, i.e. in the worker's OS time zone, while Frappe's
+# naive values are in Frappe's *system* time zone. When the two differ every
+# timestamp is shifted. New tables therefore declare Frappe's time zone on
+# their DateTime columns and the engine sends aware datetimes to them. Columns
+# created without a time zone keep the old behaviour, so their existing rows
+# and new rows stay consistent.
+_TZ_NAME_RE = re.compile(r"^[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)*$")
+_DATETIME_TZ_RE = re.compile(r"^DateTime(?:64)?\(\s*(?:\d+\s*,\s*)?'([^']+)'\s*\)$")
+
+
+def valid_timezone(name: str | None) -> str | None:
+    """Return ``name`` if it is a usable IANA time zone, else ``None``."""
+    if not name or not _TZ_NAME_RE.match(name):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - unknown zone or no tz database
+        return None
+    return name
+
+
+def with_timezone(clickhouse_type: str, timezone: str | None) -> str:
+    """``DateTime64(6)`` -> ``DateTime64(6, 'Zone')`` (other types unchanged)."""
+    if not timezone:
+        return clickhouse_type
+    match = re.match(r"^DateTime64\(\s*(\d+)\s*\)$", clickhouse_type)
+    if match:
+        return f"DateTime64({match.group(1)}, '{timezone}')"
+    if clickhouse_type == "DateTime":
+        return f"DateTime('{timezone}')"
+    return clickhouse_type
+
+
+def column_timezone(clickhouse_type: str) -> str | None:
+    """The explicit time zone of a live DateTime column, if it has one."""
+    base, _nullable = _strip_wrappers(clickhouse_type)
+    match = _DATETIME_TZ_RE.match(base)
+    return valid_timezone(match.group(1)) if match else None
+
+
+def strip_timezone(clickhouse_type: str) -> str:
+    """Drop a DateTime time zone, for comparing types (not for DDL)."""
+    return re.sub(
+        r"DateTime(64)?\(\s*(\d+)?\s*,?\s*'[^']*'\s*\)",
+        lambda m: f"DateTime64({m.group(2)})" if m.group(1) else "DateTime",
+        clickhouse_type,
+    )
+
+
+def attach_timezone(value: Any, timezone: str) -> Any:
+    """Make a naive ``datetime`` aware in ``timezone``; other values unchanged."""
+    if isinstance(value, _dt.datetime) and value.tzinfo is None:
+        from zoneinfo import ZoneInfo
+
+        return value.replace(tzinfo=ZoneInfo(timezone))
+    return value

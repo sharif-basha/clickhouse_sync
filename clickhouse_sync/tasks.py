@@ -111,11 +111,42 @@ def run_configuration_sync(
     }
 
 
-def _enqueue_enabled_configs(trigger: str = "Scheduler") -> list[str]:
-    """Enqueue a long-queue job for every scheduler-enabled configuration.
+SCHEDULER_TICK_MINUTES = 15
+# A run that started slightly less than one interval ago still counts as due,
+# so a 60-minute configuration is not pushed to every 75 minutes by jitter in
+# the scheduler's timing.
+SCHEDULE_SLACK_MINUTES = 2
 
-    Configurations run in ``priority`` order (ascending). Each is enqueued as
-    a deduplicated job so overlapping scheduler ticks cannot double-run one.
+
+def _last_started() -> dict[str, object]:
+    """Start time of each configuration's most recent run, from the Sync Log."""
+    rows = frappe.db.sql(
+        """
+        SELECT configuration, MAX(start_time) AS last_start
+        FROM `tabClickHouse Sync Log`
+        GROUP BY configuration
+        """,
+        as_dict=True,
+    )
+    return {r["configuration"]: r["last_start"] for r in rows}
+
+
+def is_due(interval_minutes: int, last_start: object, now: object) -> bool:
+    """Whether a configuration with ``interval_minutes`` should run now."""
+    if interval_minutes <= SCHEDULER_TICK_MINUTES or not last_start:
+        return True
+    elapsed = (get_datetime(now) - get_datetime(last_start)).total_seconds() / 60
+    return elapsed >= interval_minutes - SCHEDULE_SLACK_MINUTES
+
+
+def _enqueue_enabled_configs(trigger: str = "Scheduler") -> list[str]:
+    """Enqueue a long-queue job for every scheduler-enabled configuration that is due.
+
+    Configurations run in ``priority`` order (ascending). Each has its own
+    ``Sync Interval (Minutes)``: the scheduler ticks every 15 minutes and
+    skips a configuration whose last run started less than its interval ago,
+    so a large Full-mode DocType can run hourly or daily. Each job is
+    de-duplicated, so overlapping ticks cannot double-run one.
 
     Returns:
         The list of configuration names that were enqueued.
@@ -123,12 +154,17 @@ def _enqueue_enabled_configs(trigger: str = "Scheduler") -> list[str]:
     configs = frappe.get_all(
         "ClickHouse Sync Configuration",
         filters={"enabled": 1, "scheduler_enabled": 1},
-        fields=["name"],
+        fields=["name", "sync_interval_minutes"],
         order_by="priority asc",
     )
+    last_started = _last_started()
+    now = now_datetime()
 
     enqueued: list[str] = []
     for config in configs:
+        interval = cint(config.get("sync_interval_minutes")) or SCHEDULER_TICK_MINUTES
+        if not is_due(interval, last_started.get(config.name), now):
+            continue
         if enqueue_config_sync(config.name, trigger=trigger)["queued"]:
             enqueued.append(config.name)
 

@@ -38,6 +38,14 @@ class ClickHouseSyncConfiguration(Document):
             self.delete_strategy = "Ignore"
         if not self.sync_mode:
             self.sync_mode = "Incremental"
+        # The scheduler ticks every 15 minutes; shorter intervals mean "every tick".
+        if cint(self.get("sync_interval_minutes")) < 15:
+            self.sync_interval_minutes = 15
+        lag = self.get("cursor_safety_lag_seconds")
+        if lag is None or lag == "" or cint(lag) < 0:
+            self.cursor_safety_lag_seconds = sync_engine.CURSOR_SAFETY_LAG_SECONDS
+        elif cint(lag) > sync_engine.MAX_CURSOR_SAFETY_LAG_SECONDS:
+            self.cursor_safety_lag_seconds = sync_engine.MAX_CURSOR_SAFETY_LAG_SECONDS
         self._validate_source_doctype()
 
     def _validate_source_doctype(self) -> None:

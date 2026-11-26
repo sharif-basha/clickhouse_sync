@@ -63,10 +63,16 @@ from clickhouse_sync.clickhouse.schema import (
     ensure_table,
     get_child_doctypes,
     insert_columns,
+    is_creation_partitioned,
     reconcile_schema,
     table_name_for,
 )
-from clickhouse_sync.clickhouse.type_mapping import coerce_value, empty_value_for
+from clickhouse_sync.clickhouse.type_mapping import (
+    attach_timezone,
+    coerce_value,
+    column_timezone,
+    empty_value_for,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from clickhouse_connect.driver.client import Client
@@ -78,12 +84,14 @@ DEFAULT_BATCH_SIZE = 25000
 PROGRESS_THROTTLE_SECONDS = 1.0
 VALID_SYNC_MODES = ("Full", "Incremental")
 
-# Incremental runs start this long *before* the saved cursor. Frappe stamps
+# Default for how long *before* the saved cursor incremental runs start (each
+# configuration can set its own, see ``Cursor Safety Lag``). Frappe stamps
 # ``modified`` when a document is saved, not when its transaction commits, so a
 # row can become visible slightly after a later-stamped row was already read.
 # Re-reading a short overlap closes that gap; duplicates are harmless because
 # the target table is a ReplacingMergeTree keyed on ``name``.
 CURSOR_SAFETY_LAG_SECONDS = 300
+MAX_CURSOR_SAFETY_LAG_SECONDS = 7 * 24 * 3600
 
 # Rows stamped further in the future than this (relative to the run watermark)
 # are reported as unreachable by incremental sync until that time arrives.
@@ -126,6 +134,13 @@ class SyncContext:
     mode_overridden: bool = False
     # Live progress writer for the dashboard (never ``None`` during a run).
     live: Any = None
+    # How far before the saved cursor an incremental run starts reading.
+    safety_lag_seconds: int = 300
+    # Partition new tables by creation month (see schema.build_table_schema).
+    partition_by_creation: bool = False
+    # Values that could not be converted to their column type, per column.
+    # They are written as NULL; the counts are reported on the run.
+    unconverted: dict[str, int] = field(default_factory=dict)
     schema: TableSchema = field(init=False)
 
     def __post_init__(self) -> None:
@@ -133,6 +148,7 @@ class SyncContext:
             self.doctype,
             include_soft_delete=(self.delete_strategy == "Soft Delete"),
             exclude_fields=set(self.exclude_fields),
+            partition_by_creation=self.partition_by_creation,
         )
 
 
@@ -178,17 +194,7 @@ def request_cancel(config_name: str) -> None:
 
 def _cancel_requested_at(config_name: str) -> datetime | None:
     """When a stop was requested for ``config_name``, if one is pending."""
-    try:
-        cache = frappe.cache()
-        key = _cancel_key(config_name)
-        _forget_local_cache_entry(cache, key)
-        try:
-            value = cache.get_value(key, expires=True)
-        except TypeError:
-            value = cache.get_value(key)
-            _forget_local_cache_entry(cache, key)
-    except Exception:  # noqa: BLE001 - Redis unavailable: no stop request known
-        return None
+    value = live_status.read_fresh(_cancel_key(config_name))
     if not value:
         return None
     try:
@@ -207,39 +213,12 @@ def _clear_cancel(config_name: str) -> None:
 def _is_cancelled(config_name: str) -> bool:
     """Return ``True`` if a cancel has been requested, reading Redis directly.
 
-    Frappe keeps a per-request/per-job copy of cache reads in
-    ``frappe.local.cache``. A plain ``get_value`` therefore returns the value
-    seen on the *first* check for the rest of the job, so a long-running sync
-    would never notice the Cancel button being pressed in another process.
-    Drop any local copy before each read, and read with ``expires=True`` so
-    the result is not stored locally again.
+    Frappe keeps a per-job copy of cache reads in ``frappe.local.cache``, so a
+    plain ``get_value`` would keep returning the first value seen and a long
+    sync would never notice the Cancel button. :func:`live_status.read_fresh`
+    bypasses that copy. A Redis outage reads as "not cancelled".
     """
-    try:
-        cache = frappe.cache()
-        key = _cancel_key(config_name)
-        _forget_local_cache_entry(cache, key)
-        try:
-            value = cache.get_value(key, expires=True)
-        except TypeError:  # very old wrappers without the ``expires`` argument
-            _forget_local_cache_entry(cache, key)
-            value = cache.get_value(key)
-            _forget_local_cache_entry(cache, key)
-    except Exception as exc:  # noqa: BLE001 - a Redis outage must not fail the sync
-        frappe.logger("clickhouse_sync").warning(f"cancel check failed for {config_name}: {exc}")
-        return False
-    return bool(value)
-
-
-def _forget_local_cache_entry(cache: Any, key: str) -> None:
-    """Remove ``key`` from Frappe's in-process cache copy, if there is one."""
-    local_cache = getattr(getattr(frappe, "local", None), "cache", None)
-    make_key = getattr(cache, "make_key", None)
-    if not isinstance(local_cache, dict) or make_key is None:
-        return
-    try:
-        local_cache.pop(make_key(key), None)
-    except Exception:  # noqa: BLE001 - a cache quirk must never break a sync
-        pass
+    return bool(live_status.read_fresh(_cancel_key(config_name)))
 
 
 # --------------------------------------------------------------------------- #
@@ -326,7 +305,20 @@ def build_context(
         sync_child_tables=_coerce_flag(config.get("sync_child_tables"), default=False),
         previous_cursor=last_ts,
         mode_overridden=run_mode != saved_mode,
+        safety_lag_seconds=_safety_lag(config.get("cursor_safety_lag_seconds")),
+        partition_by_creation=_coerce_flag(config.get("partition_by_creation"), default=False),
     )
+
+
+def _safety_lag(value: object) -> int:
+    """The configured overlap in seconds; unset means the default.
+
+    Long-running transactions (bulk imports, slow submits) can commit rows
+    stamped earlier than the default window covers; such sites raise it.
+    """
+    if value is None or value == "":
+        return CURSOR_SAFETY_LAG_SECONDS
+    return max(0, min(cint(value), MAX_CURSOR_SAFETY_LAG_SECONDS))
 
 
 def _coerce_flag(value: object, *, default: bool) -> bool:
@@ -362,25 +354,16 @@ def _clamp_batch_size(value: int) -> int:
 # --------------------------------------------------------------------------- #
 # MariaDB streaming reader (keyset pagination)
 # --------------------------------------------------------------------------- #
-def _source_field_order(schema: TableSchema) -> list[str]:
-    """Columns to read from MariaDB, in the exact ClickHouse insert order.
-
-    Engine-managed columns (sync timestamp, soft-delete flag) are excluded -
-    they are synthesised at insert time, not read from the source.
-    """
-    managed = {SYNC_TIMESTAMP_COLUMN, SOFT_DELETE_COLUMN}
-    return [c.name for c in schema.columns if c.name not in managed]
-
-
 def incremental_lower_bound(ctx: SyncContext) -> datetime | None:
     """Return the ``modified`` value an incremental run starts reading from.
 
     ``None`` means "no lower bound" (Full mode, or the very first incremental
-    run). Otherwise it is the saved cursor minus :data:`CURSOR_SAFETY_LAG_SECONDS`.
+    run). Otherwise it is the saved cursor minus the configuration's safety
+    lag (default :data:`CURSOR_SAFETY_LAG_SECONDS`).
     """
     if ctx.sync_mode != "Incremental" or ctx.last_sync_timestamp is None:
         return None
-    return ctx.last_sync_timestamp - timedelta(seconds=CURSOR_SAFETY_LAG_SECONDS)
+    return ctx.last_sync_timestamp - timedelta(seconds=ctx.safety_lag_seconds)
 
 
 def _select_fields(ctx: SyncContext, fields: list[str]) -> list[str]:
@@ -422,85 +405,82 @@ def stream_source_rows(
         Lists of row dicts, each no larger than ``ctx.batch_size``.
     """
     select_fields = _select_fields(ctx, fields)
-    if ctx.sync_mode == "Incremental":
-        yield from _stream_by_modified(ctx, select_fields, upper or now_datetime())
-    else:
-        yield from _stream_by_name(ctx, select_fields)
+    yield from keyset_batches(
+        ctx,
+        f"`tab{ctx.doctype}`",
+        select_fields,
+        upper=upper or now_datetime(),
+    )
 
 
-def _stream_by_name(
-    ctx: SyncContext, select_fields: list[str]
-) -> Iterator[list[dict[str, Any]]]:
-    """Full-table read ordered by primary key (``WHERE name > :last``)."""
-    table = f"`tab{ctx.doctype}`"
-    col_sql = ", ".join(f"`{c}`" for c in select_fields)
-    last_name: Any = ""
-
-    while True:
-        params: dict[str, Any] = {"last_name": last_name, "limit": ctx.batch_size}
-        query = (
-            f"SELECT {col_sql} FROM {table} "
-            f"WHERE name > %(last_name)s "
-            f"ORDER BY name ASC LIMIT %(limit)s"
-        )
-        rows: list[dict[str, Any]] = frappe.db.sql(query, params, as_dict=True)
-        if not rows:
-            break
-
-        yield rows
-        last_name = rows[-1]["name"]
-        if len(rows) < ctx.batch_size:
-            break
-
-
-def _stream_by_modified(
+def keyset_batches(
     ctx: SyncContext,
+    table_sql: str,
     select_fields: list[str],
+    *,
     upper: datetime,
+    conditions: list[str] | None = None,
+    params: dict[str, Any] | None = None,
 ) -> Iterator[list[dict[str, Any]]]:
-    """Changed-row read ordered by ``(modified, name)``, bounded by ``upper``.
+    """Read ``table_sql`` in keyset-paginated batches - parent and child alike.
 
-    The first window starts at :func:`incremental_lower_bound` (inclusive, so
-    rows sharing the boundary timestamp are never skipped). Every later window
-    continues strictly after the last row yielded, using ``name`` to break ties
-    between rows with an identical ``modified`` - this keeps the loop correct
-    even when more rows than one batch share the same timestamp (bulk imports).
+    Full mode pages on ``name``. Incremental mode pages on
+    ``(modified, name)`` up to ``upper``: the first window starts at
+    :func:`incremental_lower_bound` (inclusive, so rows sharing the boundary
+    timestamp are never skipped) and every later window continues strictly
+    after the last row yielded, using ``name`` to break ties between rows
+    with an identical ``modified`` - correct even when more rows than one
+    batch share a timestamp (bulk imports). The ordering rides the
+    ``modified`` index, which InnoDB extends with the primary key.
 
-    The ordering rides the ``modified`` index, which InnoDB extends with the
-    primary key, so only changed rows are touched.
+    ``conditions``/``params`` add fixed filters (e.g. a child table's
+    ``parenttype``). ``select_fields`` must include ``name`` and, for
+    incremental mode, ``modified``.
     """
-    table = f"`tab{ctx.doctype}`"
     col_sql = ", ".join(f"`{c}`" for c in select_fields)
+    incremental = ctx.sync_mode == "Incremental"
     lower = incremental_lower_bound(ctx)
-
-    position: tuple[datetime, Any] | None = None  # (modified, name) of last row yielded
+    position: tuple[datetime | None, Any] | None = None  # (modified, name) of the last row
 
     while True:
-        conditions = ["modified <= %(upper)s"]
-        params: dict[str, Any] = {"upper": upper, "limit": ctx.batch_size}
-        if position is not None:
-            conditions.append(
-                "(modified > %(pos_modified)s "
-                "OR (modified = %(pos_modified)s AND name > %(pos_name)s))"
-            )
-            params["pos_modified"], params["pos_name"] = position
-        elif lower is not None:
-            conditions.append("modified >= %(lower)s")
-            params["lower"] = lower
+        where = list(conditions or [])
+        values: dict[str, Any] = dict(params or {})
+        values["limit"] = ctx.batch_size
+        if incremental:
+            where.append("modified <= %(upper)s")
+            values["upper"] = upper
+            if position is not None:
+                where.append(
+                    "(modified > %(pos_modified)s "
+                    "OR (modified = %(pos_modified)s AND name > %(pos_name)s))"
+                )
+                values["pos_modified"], values["pos_name"] = position
+            elif lower is not None:
+                where.append("modified >= %(lower)s")
+                values["lower"] = lower
+            order_by = "modified ASC, name ASC"
+        else:
+            where.append("name > %(last_name)s")
+            values["last_name"] = position[1] if position is not None else ""
+            order_by = "name ASC"
 
-        query = (
-            f"SELECT {col_sql} FROM {table} "
-            f"WHERE {' AND '.join(conditions)} "
-            f"ORDER BY modified ASC, name ASC LIMIT %(limit)s"
+        rows: list[dict[str, Any]] = frappe.db.sql(
+            f"SELECT {col_sql} FROM {table_sql} "
+            f"WHERE {' AND '.join(where)} "
+            f"ORDER BY {order_by} LIMIT %(limit)s",
+            values,
+            as_dict=True,
         )
-        rows: list[dict[str, Any]] = frappe.db.sql(query, params, as_dict=True)
         if not rows:
             break
 
         yield rows
-        # ``modified`` cannot be NULL here: the ``modified <= upper`` predicate
-        # already excludes NULLs.
-        position = (get_datetime(rows[-1]["modified"]), rows[-1]["name"])
+        # ``modified`` cannot be NULL in incremental mode: the
+        # ``modified <= upper`` predicate already excludes NULLs.
+        position = (
+            get_datetime(rows[-1]["modified"]) if incremental else None,
+            rows[-1]["name"],
+        )
         if len(rows) < ctx.batch_size:
             break
 
@@ -561,28 +541,63 @@ def _prepare_batch(
     # Per column: (fieldtype used for coercion, value to use for NULL). The
     # NULL substitute is only set for non-nullable columns, i.e. the storage
     # key and columns created non-nullable by older versions.
+    # A column with an explicit time zone gets aware datetimes: the driver
+    # converts naive ones with the WORKER's OS time zone, which need not be
+    # Frappe's system time zone.
     plan = [
         (
             c.name,
             c.frappe_fieldtype,
             None if c.nullable else empty_value_for(c.clickhouse_type),
+            column_timezone(c.clickhouse_type),
         )
         for c in column_defs
     ]
+    unconverted = ctx.unconverted
 
     data: list[list[Any]] = []
     for row in rows:
         record: list[Any] = []
-        for col, fieldtype, empty in plan:
+        for col, fieldtype, empty, tz in plan:
             if col == SYNC_TIMESTAMP_COLUMN:
-                record.append(synced_at)
-            elif col == SOFT_DELETE_COLUMN:
+                record.append(attach_timezone(synced_at, tz) if tz else synced_at)
+                continue
+            if col == SOFT_DELETE_COLUMN:
                 record.append(0)
-            else:
-                value = coerce_value(fieldtype or "Data", row.get(col))
-                record.append(empty if value is None and empty is not None else value)
+                continue
+            raw = row.get(col)
+            value = coerce_value(fieldtype or "Data", raw)
+            if value is None and raw not in (None, ""):
+                # Silently NULLing bad values hid data problems: count them.
+                unconverted[col] = unconverted.get(col, 0) + 1
+            if value is None and empty is not None:
+                value = empty
+            elif tz and value is not None:
+                value = attach_timezone(value, tz)
+            record.append(value)
         data.append(record)
     return columns, data
+
+
+def _creation_months(rows: list[dict[str, Any]]) -> set[str]:
+    """``YYYYMM`` partition ids of the rows' ``creation`` (for OPTIMIZE)."""
+    months: set[str] = set()
+    for row in rows:
+        created = row.get("creation")
+        if created:
+            created = get_datetime(created)
+            months.add(f"{created.year:04d}{created.month:02d}")
+        else:
+            months.add("197001")  # NULL creation lands in the epoch partition
+    return months
+
+
+def _unconverted_summary(ctx: SyncContext) -> str:
+    if not ctx.unconverted:
+        return ""
+    total = sum(ctx.unconverted.values())
+    detail = ", ".join(f"{col}: {n}" for col, n in sorted(ctx.unconverted.items()))
+    return f" WARNING: {total} value(s) could not be converted and were written as NULL ({detail})."
 
 
 def _insert_batch(
@@ -637,7 +652,9 @@ def reconcile_deletes(client: "Client", ctx: SyncContext, database: str) -> int:
     )
 
 
-DELETE_RECONCILE_BATCH_SIZE = 1000
+# Names compared per round trip. Larger pages mean fewer round trips and fewer
+# delete statements; 5,000 keeps the MariaDB IN-list comfortably small.
+DELETE_RECONCILE_BATCH_SIZE = 5000
 
 
 def _reconcile_missing_rows(
@@ -718,7 +735,15 @@ def _apply_delete(
     *,
     source_parenttype: str | None = None,
 ) -> None:
-    """Issue ONE mutation that soft- or hard-deletes ``names``."""
+    """Soft- or hard-delete ``names`` with ONE statement.
+
+    *Soft Delete* inserts a new version of each live row with the flag set
+    (``INSERT ... SELECT ... FINAL``), one millisecond newer than the row it
+    replaces, so ReplacingMergeTree keeps the flagged copy. Unlike the former
+    ``ALTER TABLE ... UPDATE`` this is an ordinary insert - no mutation that
+    rewrites data parts, no "too many mutations" limit, and the result is
+    visible at once. *Hard Delete* uses a lightweight ``DELETE``.
+    """
     if not names or strategy not in ("Soft Delete", "Hard Delete"):
         return
     conditions = []
@@ -730,8 +755,11 @@ def _apply_delete(
     if strategy == "Soft Delete":
         conditions.append(f"`{SOFT_DELETE_COLUMN}` = 0")
         client.command(
-            f"ALTER TABLE `{database}`.`{table_name}` "
-            f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 "
+            f"INSERT INTO `{database}`.`{table_name}` "
+            f"SELECT * REPLACE ("
+            f"toUInt8(1) AS `{SOFT_DELETE_COLUMN}`, "
+            f"`{SYNC_TIMESTAMP_COLUMN}` + toIntervalMillisecond(1) AS `{SYNC_TIMESTAMP_COLUMN}`"
+            f") FROM `{database}`.`{table_name}` FINAL "
             f"WHERE {' AND '.join(conditions)}",
             parameters=parameters,
         )
@@ -827,6 +855,7 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     Raises on failure so the retry wrapper can decide whether to retry.
     """
     live = ctx.live or live_status.NullLiveRun()
+    ctx.unconverted.clear()  # counted per attempt, child tables included
     live.update(force=True, phase="connecting")
     client = ch_connection.get_client()
     params = ch_connection.get_connection_params()
@@ -834,8 +863,17 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
 
     # 1. Table + schema reconciliation.
     live.update(force=True, phase="checking schema")
-    ensure_table(client, ctx.schema, database, auto_create=ctx.auto_create)
+    created = ensure_table(client, ctx.schema, database, auto_create=ctx.auto_create)
     reconcile_schema(client, ctx.schema, database, auto_update=ctx.auto_update)
+    partition_note = ""
+    if ctx.partition_by_creation and not created and not is_creation_partitioned(
+        client, database, ctx.table_name
+    ):
+        # The partition key is fixed when a table is created.
+        partition_note = (
+            " NOTE: 'Partition By Creation Month' applies to new tables; "
+            f"drop {ctx.table_name} and run a Full sync to apply it."
+        )
     # Insert into the columns the live table actually has, converted for
     # their live types (an unmigratable type change must not fail inserts).
     column_defs = insert_columns(client, ctx.schema, database)
@@ -873,6 +911,7 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     #   re-checked - unchanged since then; re-read only because each run
     #                starts a safety lag before the cursor
     split_known = incremental and ctx.previous_cursor is not None
+    touched_months: set[str] = set()
     rows_new = 0 if split_known else None
     rows_updated = 0 if split_known else None
     rows_rechecked = 0 if split_known else None
@@ -888,6 +927,7 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
 
         batch_number += 1
         result.rows_read += len(batch)
+        touched_months.update(_creation_months(batch))
         columns, data = _prepare_batch(ctx, batch, column_defs, synced_at)
         try:
             _insert_batch(client, database, ctx.table_name, columns, data)
@@ -959,6 +999,12 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
         result.rows_written += child_written
         result.message += f" {child_written} child rows synced."
 
+    unconverted_note = _unconverted_summary(ctx)
+    if unconverted_note:
+        result.message += unconverted_note
+        live.update(force=True, rows_unconverted=sum(ctx.unconverted.values()))
+        frappe.logger("clickhouse_sync").warning(f"{ctx.doctype}:{unconverted_note}")
+
     # Rows incremental sync can never see (NULL / far-future ``modified``).
     if incremental:
         unreachable = count_unreachable_rows(ctx, watermark)
@@ -994,8 +1040,12 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     )
     if should_optimize:
         live.update(force=True, phase="optimizing")
-        _optimize_table(client, database, ctx.table_name)
+        _optimize_table(
+            client, database, ctx.table_name,
+            months=None if ctx.sync_mode == "Full" else touched_months,
+        )
 
+    result.message += partition_note
     if ctx.mode_overridden:
         result.message = f"[{ctx.sync_mode} sync requested] " + result.message
 
@@ -1003,13 +1053,32 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     result.status = "Completed"
 
 
-def _optimize_table(client: "Client", database: str, table_name: str) -> None:
+def _optimize_table(
+    client: "Client",
+    database: str,
+    table_name: str,
+    months: set[str] | None = None,
+) -> None:
     """Run ``OPTIMIZE TABLE ... FINAL`` to physically deduplicate the table.
+
+    On a table partitioned by creation month, an incremental run passes the
+    months it wrote to (``months``) and only those partitions are rewritten.
+    Every other table is a single partition and is optimized whole.
 
     Failures are logged but never raise - a successful sync must not be marked
     failed just because the post-sync compaction hit a transient issue.
     """
     try:
+        if months and is_creation_partitioned(client, database, table_name):
+            for month in sorted(months):
+                client.command(
+                    f"OPTIMIZE TABLE `{database}`.`{table_name}` PARTITION ID {{pid:String}} FINAL",
+                    parameters={"pid": month},
+                )
+            frappe.logger("clickhouse_sync").info(
+                f"Optimized {len(months)} partition(s) of {table_name}."
+            )
+            return
         client.command(f"OPTIMIZE TABLE `{database}`.`{table_name}` FINAL")
         frappe.logger("clickhouse_sync").info(f"Optimized {table_name} (deduplicated).")
     except Exception as exc:  # noqa: BLE001
@@ -1090,6 +1159,7 @@ def _sync_one_child(
         include_soft_delete=(ctx.delete_strategy == "Soft Delete"),
         exclude_fields=set(ctx.exclude_fields),
         is_child=True,
+        partition_by_creation=ctx.partition_by_creation,
     )
     ensure_table(client, child_schema, database, auto_create=ctx.auto_create)
     reconcile_schema(client, child_schema, database, auto_update=ctx.auto_update)
@@ -1106,47 +1176,23 @@ def _sync_one_child(
             fields.append(required)
     insert_names = {c.name for c in column_defs}
 
-    col_sql = ", ".join(f"`{c}`" for c in fields)
-    src_table = f"`tab{child_doctype}`"
     written = 0
     batch_number = 0
     touched_parents: set[str] = set()
+    touched_months: set[str] = set()
     live = ctx.live or live_status.NullLiveRun()
     lower = incremental_lower_bound(ctx)
-    position: tuple[datetime, Any] | None = None
 
-    while True:
+    for rows in keyset_batches(
+        ctx,
+        f"`tab{child_doctype}`",
+        fields,
+        upper=synced_at,
+        conditions=["parenttype = %(ptype)s"],
+        params={"ptype": ctx.doctype},
+    ):
         if _is_cancelled(ctx.config_name):
             raise SyncCancelledError(f"Sync cancelled for {ctx.config_name}.")
-        conditions = ["parenttype = %(ptype)s"]
-        params: dict[str, Any] = {"ptype": ctx.doctype, "limit": ctx.batch_size}
-        if ctx.sync_mode == "Incremental":
-            conditions.append("modified <= %(upper)s")
-            params["upper"] = synced_at
-            if position is not None:
-                conditions.append(
-                    "(modified > %(pos_modified)s "
-                    "OR (modified = %(pos_modified)s AND name > %(pos_name)s))"
-                )
-                params["pos_modified"], params["pos_name"] = position
-            elif lower is not None:
-                conditions.append("modified >= %(lower)s")
-                params["lower"] = lower
-            order_by = "modified ASC, name ASC"
-        else:
-            conditions.append("name > %(last_name)s")
-            params["last_name"] = position[1] if position is not None else ""
-            order_by = "name ASC"
-
-        rows: list[dict[str, Any]] = frappe.db.sql(
-            f"SELECT {col_sql} FROM {src_table} WHERE {' AND '.join(conditions)} "
-            f"ORDER BY {order_by} LIMIT %(limit)s",
-            params,
-            as_dict=True,
-        )
-        if not rows:
-            break
-
         columns, data = _prepare_batch(ctx, rows, column_defs, synced_at)
         client.insert(
             table=child_schema.table_name,
@@ -1157,6 +1203,7 @@ def _sync_one_child(
         written += len(data)
         batch_number += 1
         touched_parents.update(row.get("parent") for row in rows if row.get("parent"))
+        touched_months.update(_creation_months(rows))
         # Keep the dashboard heartbeat alive: a large child table can take
         # longer than the stall threshold.
         live.update(
@@ -1165,13 +1212,6 @@ def _sync_one_child(
             child_rows_written=written,
             child_batch=batch_number,
         )
-        position = (
-            (get_datetime(rows[-1]["modified"]), rows[-1]["name"])
-            if ctx.sync_mode == "Incremental"
-            else (synced_at, rows[-1]["name"])
-        )
-        if len(rows) < ctx.batch_size:
-            break
 
     if ctx.delete_strategy != "Ignore":
         live.update(force=True, phase=f"reconciling child table {child_doctype}")
@@ -1205,7 +1245,10 @@ def _sync_one_child(
         ctx.sync_mode == "Full" or not ctx.optimize_only_on_full
     ):
         live.update(force=True, phase=f"optimizing {child_schema.table_name}")
-        _optimize_table(client, database, child_schema.table_name)
+        _optimize_table(
+            client, database, child_schema.table_name,
+            months=None if ctx.sync_mode == "Full" else touched_months,
+        )
 
     return written
 

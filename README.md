@@ -203,13 +203,16 @@ cached copy of the dashboard script.
 | --- | --- |
 | Source DocType | The DocType to copy. The table is named `tab_` + the DocType in lower case with spaces as `_` (for example `tab_sales_invoice`). |
 | Enabled / Scheduler Enabled / Priority | Disabled configurations are listed on the dashboard but not synced or totalled. Lower priority numbers are queued first. |
+| Sync Interval (Minutes) | How often the scheduler runs it (default 15). The scheduler ticks every 15 minutes; use 60, 360 or 1440 for large Full-mode DocTypes. |
 | Sync Mode | **Incremental** (recommended) or **Full**. |
+| Cursor Safety Lag (Seconds) | Incremental runs re-read this much before the saved position (default 300), for transactions that commit late. Raise it where long imports or submits run. |
 | Batch Size | Records per batch, kept between 1,000 and 100,000 (default 25,000). Use 5,000–10,000 for DocTypes with large text fields. |
 | Auto Create Table / Auto Update Schema | Create the table and add new columns automatically. |
 | Optimize After Sync / Optimize Only On Full | Run `OPTIMIZE TABLE … FINAL` after a run. This rewrites the whole table, so *Optimize Only On Full* is on by default for new configurations; query with `FINAL` between full syncs. |
 | Delete Strategy | Ignore, Soft Delete (`_ch_is_deleted = 1`) or Hard Delete. |
 | Reconcile Deletes (Incremental) | Also compare full key sets on incremental runs. Costly on large tables. Without it, incremental runs still check the child rows of every parent changed in the run. |
 | Sync Child Tables | Copy the DocType's child tables too. |
+| Partition By Creation Month | For large DocTypes: partition the table (and its child tables) by creation month, so post-sync OPTIMIZE rewrites only the months a run touched. Applies when the table is created. |
 | Excluded Fields | Fields never copied (use the *Select Fields to Exclude* picker). Password fields and names such as `api_key`, `*_secret` and `*_token` are always excluded. |
 | Retry Count / Retry Interval | Attempts per run and the base wait in seconds, doubled per attempt. |
 | Last Sync Timestamp | The cursor; see [How a sync works](#how-a-sync-works). |
@@ -257,8 +260,14 @@ WHERE docstatus = 1
 GROUP BY customer;
 ```
 
-With *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. `_ch_synced_at`
-records when each row was written.
+With *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. A soft delete is
+written as a new version of the row with the flag set, so `FINAL` is what
+makes the flag visible. `_ch_synced_at` records when each row was written.
+
+Tables created by this version declare Frappe's system time zone on their
+DateTime columns, so instants are correct whatever the server's OS time zone.
+Tables created earlier have no time zone: their values were written using the
+worker's OS time zone and are left as they are, so old and new rows agree.
 
 ## Security
 
@@ -308,9 +317,10 @@ clickhouse_sync/
 │   ├── schema.py          # table DDL, schema reconciliation, field exclusion
 │   ├── type_mapping.py    # Frappe field type -> ClickHouse type, value coercion
 │   ├── exceptions.py      # error types, transient/permanent classification, categories
+│   ├── warehouse_stats.py # table sizes from system.parts (shared by API, dashboard, report)
 │   └── alerts.py          # Telegram messages
 ├── api/
-│   ├── api.py             # configuration-form and legacy endpoints
+│   ├── api.py             # stable endpoints for the desk script, forms, cards, other apps
 │   └── dashboard.py       # dashboard endpoints
 ├── tasks.py               # scheduler and background-job entry points
 ├── hooks.py               # scheduler events, after_delete hook, assets, fixtures
@@ -342,18 +352,21 @@ ClickHouse client and is reused by `ai_insights`.
 
 ## Known limitations
 
-These are documented in the audit report and scheduled for the next stages:
-
-- **Schedule.** Every scheduler-enabled configuration is queued every 15
-  minutes; there is no per-configuration frequency yet. Full-mode configurations therefore reload their whole table
-  on every tick: prefer Incremental, or turn off *Scheduler Enabled* for large
-  Full-mode DocTypes and run them on demand.
+- **Schedule granularity** is the 15-minute scheduler tick: a *Sync
+  Interval* is rounded up to the next tick.
 - **Renamed documents** leave their old name behind until a Full sync with a
   delete strategy reconciles it.
 - **Queued deletes** live in the Redis cache; a Redis restart loses the ones
   not yet applied. Reconciliation repairs them.
-- **Per-run OPTIMIZE** rewrites the whole table when enabled for incremental
-  runs (*Optimize Only On Full* off).
+- **Per-run OPTIMIZE** on incremental runs (*Optimize Only On Full* off)
+  rewrites the whole table unless it is partitioned by creation month.
+- **Partitioning and time zones** are fixed when a table is created. To apply
+  *Partition By Creation Month* or a time zone to an existing table, drop it
+  in ClickHouse and run a Full sync.
+- **Delete reconciliation** pages through ClickHouse names and looks each page
+  up in MariaDB. A single anti-join would be faster, but MariaDB's
+  case-insensitive collation and ClickHouse's byte order sort names
+  differently, so range-based comparisons could flag live rows as deleted.
 - **Column changes** that cannot be migrated safely (for example a field
   changed from Data to Int, or narrowing a type) are logged and the existing
   column is kept; values are converted for the column that exists.
@@ -382,6 +395,32 @@ These are documented in the audit report and scheduled for the next stages:
 | `git push` says password authentication is not supported | Use a GitHub personal access token as the password, or SSH. |
 
 ## Changelog
+
+### Unreleased (code review fixes, part 2)
+
+- **Per-configuration schedule:** *Sync Interval (Minutes)* lets large
+  Full-mode DocTypes run hourly or daily instead of every 15 minutes.
+- **Configurable overlap:** *Cursor Safety Lag (Seconds)* per configuration.
+- **Time zones:** new tables declare Frappe's system time zone and receive
+  aware datetimes; the driver had converted naive values with the worker's OS
+  time zone. Existing tables are unchanged.
+- **Soft deletes** are written as a new row version (`INSERT ... SELECT
+  FINAL`) instead of an `ALTER TABLE ... UPDATE` mutation.
+- **Partition By Creation Month** (opt-in, new tables): post-sync OPTIMIZE
+  rewrites only the months a run touched.
+- **Unconvertible values** (e.g. text in an Int field) are counted and
+  reported on the run instead of silently becoming NULL.
+- Delete reconciliation compares 5,000 names per round trip (was 1,000).
+- Dashboard: pending counts are cached for 60 s; the error category
+  breakdown covers up to 500 failed runs instead of the 25 listed; optimizing
+  and reconciling phases are not shown as stalled for up to 3 hours.
+- One shared batch reader for parent and child tables, one Redis read helper,
+  and one `system.parts` query for the API, dashboard and Largest Tables report.
+- One version number (`clickhouse_sync.__version__`) and one build system
+  (`pyproject.toml`); `setup.py` removed.
+
+**Upgrade notes.** Run `bench migrate` for the three new configuration
+fields. Nothing changes for existing tables until you opt in.
 
 ### Unreleased (code review fixes)
 

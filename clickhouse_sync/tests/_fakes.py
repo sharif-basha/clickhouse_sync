@@ -289,6 +289,7 @@ class FakeClickHouse:
         # Tables created by a test directly have no entry (columns unknown).
         self.columns: dict[str, dict[str, str]] = {}
         self.queries: list[tuple[str, dict[str, Any]]] = []
+        self.partition_keys: dict[str, str] = {}
         self.commands: list[str] = []
         self.command_calls: list[tuple[str, dict[str, Any]]] = []
         self.insert_log: list[tuple[str, int]] = []
@@ -320,6 +321,9 @@ class FakeClickHouse:
         match = re.search(r"CREATE TABLE IF NOT EXISTS `[^`]+`\.`([^`]+)`", sql)
         if match:
             self.tables.setdefault(match.group(1), {})
+            part = re.search(r"PARTITION BY (.+)\n", sql)
+            if part and part.group(1).strip() != "tuple()":
+                self.partition_keys[match.group(1)] = part.group(1).replace("`", "")
             body = sql.split("(", 1)[1].rsplit("ENGINE", 1)[0]
             self.columns[match.group(1)] = {
                 m.group(1): m.group(2).strip().rstrip(",").strip()
@@ -332,7 +336,7 @@ class FakeClickHouse:
         if match:
             self.columns.setdefault(match.group(1), {})[match.group(2)] = match.group(3).strip()
             return
-        match = re.search(r"(?:ALTER TABLE|DELETE FROM) `[^`]+`\.`([^`]+)`", sql)
+        match = re.search(r"(?:ALTER TABLE|DELETE FROM|INSERT INTO) `[^`]+`\.`([^`]+)`", sql)
         if not match:
             return
         table = self.tables.get(match.group(1), {})
@@ -345,7 +349,7 @@ class FakeClickHouse:
                 name for name in names
                 if name in table and table[name].get("parenttype") == parenttype
             ]
-        if "UPDATE `_ch_is_deleted` = 1" in sql:
+        if "UPDATE `_ch_is_deleted` = 1" in sql or "toUInt8(1) AS `_ch_is_deleted`" in sql:
             for name in names:
                 if name in table and not table[name].get("_ch_is_deleted"):
                     table[name]["_ch_is_deleted"] = 1
@@ -369,6 +373,9 @@ class FakeClickHouse:
                 and not (live_only and row.get("_ch_is_deleted"))
             )
             return types.SimpleNamespace(result_rows=[[name] for name in names])
+        if "partition_key FROM system.tables" in sql:
+            table = (parameters or {}).get("tbl")
+            return types.SimpleNamespace(result_rows=[[self.partition_keys.get(table, "")]])
         if "system.tables" in sql:
             table = (parameters or {}).get("tbl")
             if table is None:

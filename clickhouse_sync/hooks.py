@@ -8,13 +8,15 @@ propagation), scheduler events, and exported fixtures.
 
 from __future__ import annotations
 
+from clickhouse_sync import __version__
+
 app_name = "clickhouse_sync"
 app_title = "ClickHouse Sync"
 app_publisher = "RySS / Common Ground Initiative"
 app_description = "Automatic, high-throughput synchronisation of Frappe (MariaDB) data into ClickHouse for high-performance reporting."
 app_email = "data@ryss.example.org"
 app_license = "MIT"
-app_version = "1.7.0"
+app_version = __version__
 required_apps = ["frappe"]
 
 # --------------------------------------------------------------------------- #

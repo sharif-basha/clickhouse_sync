@@ -35,6 +35,7 @@ from frappe.utils import cint, get_datetime, now_datetime
 from clickhouse_sync.clickhouse import connection as ch_connection
 from clickhouse_sync.clickhouse import live_status
 from clickhouse_sync.clickhouse.exceptions import categorize_text
+from clickhouse_sync.clickhouse.warehouse_stats import table_sizes
 from clickhouse_sync.clickhouse.schema import (
     SOFT_DELETE_COLUMN,
     table_exists,
@@ -51,6 +52,12 @@ CONFIG_DOCTYPE = "ClickHouse Sync Configuration"
 JOB_TIMEOUT_SECONDS = 21600
 
 COUNTS_FRESH_SECONDS = 600
+# Pending counts change with every save, so they are refreshed far more often
+# than the full counts - but not on every 30-second dashboard refresh, which
+# ran one COUNT per configuration per request and could time the page out.
+PENDING_FRESH_SECONDS = 60
+# Failed runs whose category is worked out for the "by category" breakdown.
+ERROR_CATEGORY_SAMPLE = 500
 COUNTS_STORE_SECONDS = 3600
 SOURCE_COUNT_TIME_LIMIT_SECONDS = 10
 WAREHOUSE_COUNT_TIME_LIMIT_SECONDS = 20
@@ -254,12 +261,20 @@ def _counts_for(config: dict[str, Any], warehouse: _Warehouse, force: bool) -> d
     now = now_datetime()
     cached = None if force else live_status.get_counts(config["name"])
     if cached and (_age_seconds(cached.get("counted_at"), now) or 0) < COUNTS_FRESH_SECONDS:
-        # Pending is cheap (index range on ``modified``) and changes with
-        # every save, so it is always fresh.
         cached = dict(cached)
-        cached["pending"] = _pending_count(
-            config["source_doctype"], config.get("last_sync_timestamp"), cached.get("source")
+        pending_fresh = (
+            "pending" in cached
+            and cached.get("pending_cursor") == str(config.get("last_sync_timestamp"))
+            and (_age_seconds(cached.get("pending_at"), now) or PENDING_FRESH_SECONDS)
+            < PENDING_FRESH_SECONDS
         )
+        if not pending_fresh:
+            cached["pending"] = _pending_count(
+                config["source_doctype"], config.get("last_sync_timestamp"), cached.get("source")
+            )
+            cached["pending_at"] = now.isoformat(sep=" ")
+            cached["pending_cursor"] = str(config.get("last_sync_timestamp"))
+            live_status.set_counts(config["name"], cached, COUNTS_STORE_SECONDS)
         return cached
 
     source, approximate = _source_count(config["source_doctype"])
@@ -273,13 +288,14 @@ def _counts_for(config: dict[str, Any], warehouse: _Warehouse, force: bool) -> d
         "warehouse_note": wh_note,
         "counted_at": now.isoformat(sep=" "),
     }
-    # Do not cache a warehouse failure: the next request should try again.
-    if wh_count is not None or wh_note == "no table":
-        live_status.set_counts(config["name"], counts, COUNTS_STORE_SECONDS)
-    counts = dict(counts)
     counts["pending"] = _pending_count(
         config["source_doctype"], config.get("last_sync_timestamp"), source
     )
+    counts["pending_at"] = now.isoformat(sep=" ")
+    counts["pending_cursor"] = str(config.get("last_sync_timestamp"))
+    # Do not cache a warehouse failure: the next request should try again.
+    if wh_count is not None or wh_note == "no table":
+        live_status.set_counts(config["name"], counts, COUNTS_STORE_SECONDS)
     return counts
 
 
@@ -332,6 +348,9 @@ def _per_config_history() -> dict[str, dict[str, Any]]:
 
 
 def _errors(since: Any, limit: int = 25) -> dict[str, Any]:
+    # The category breakdown used to count only the 25 rows listed, while the
+    # totals counted every failure in the window. Categorise a much larger
+    # sample (newest first) and say how many were included.
     rows = frappe.db.sql(
         """
         SELECT name, configuration, creation, end_time, message, exception,
@@ -341,15 +360,17 @@ def _errors(since: Any, limit: int = 25) -> dict[str, Any]:
         ORDER BY creation DESC
         LIMIT %(limit)s
         """,
-        {"since": since, "limit": limit},
+        {"since": since, "limit": max(limit, ERROR_CATEGORY_SAMPLE)},
         as_dict=True,
     )
     recent = []
     categories: dict[str, int] = {}
-    for row in rows:
+    for index, row in enumerate(rows):
         detail = live_status.get_run_detail(row["name"]) or {}
         category = detail.get("category") or categorize_text(row.get("message"), row.get("exception"))
         categories[category] = categories.get(category, 0) + 1
+        if index >= limit:
+            continue
         recent.append(
             {
                 "log": row["name"],
@@ -383,6 +404,7 @@ def _errors(since: Any, limit: int = 25) -> dict[str, Any]:
         "by_category": [
             {"category": k, "count": v} for k, v in sorted(categories.items(), key=lambda kv: -kv[1])
         ],
+        "categorised_runs": len(rows),
     }
 
 
@@ -459,22 +481,10 @@ def _warehouse_tables(warehouse: _Warehouse) -> list[dict[str, Any]]:
     if client is None:
         return []
     try:
-        result = client.query(
-            """
-            SELECT table, sum(rows) AS rows, sum(bytes_on_disk) AS bytes, count() AS parts
-            FROM system.parts
-            WHERE database = {db:String} AND active
-            GROUP BY table
-            ORDER BY bytes DESC
-            LIMIT 15
-            """,
-            parameters={"db": warehouse.database},
-            settings={"max_execution_time": WAREHOUSE_COUNT_TIME_LIMIT_SECONDS},
+        return table_sizes(
+            client, warehouse.database, limit=15,
+            time_limit_seconds=WAREHOUSE_COUNT_TIME_LIMIT_SECONDS,
         )
-        return [
-            {"table": r[0], "rows": int(r[1]), "bytes": int(r[2]), "parts": int(r[3])}
-            for r in result.result_rows
-        ]
     except Exception:  # noqa: BLE001
         return []
 

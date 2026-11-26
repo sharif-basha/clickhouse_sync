@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import frappe
 
@@ -39,7 +39,9 @@ from clickhouse_sync.clickhouse.type_mapping import (
     fieldtype_for_clickhouse_type,
     is_nullable_type,
     is_stored_field,
-    map_fieldtype,
+    strip_timezone,
+    valid_timezone,
+    with_timezone,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -95,6 +97,26 @@ _SCHEMA_CACHE_TTL = 300  # seconds
 # idempotent: re-running it replaces each row's prior copy instead of stacking
 # duplicates. Queries can add FINAL to force deduplication at read time.
 DEFAULT_ENGINE = "ReplacingMergeTree"
+
+# Optional partitioning for large tables. ``creation`` never changes, so a
+# record always stays in one partition and ReplacingMergeTree (which only
+# deduplicates within a partition) still keeps one row per record. It lets an
+# incremental run OPTIMIZE just the months it wrote to instead of the table.
+CREATION_PARTITION_EXPRESSION = "toYYYYMM(assumeNotNull(`creation`))"
+
+
+def system_timezone() -> str | None:
+    """Frappe's system time zone (System Settings), if it is a valid zone."""
+    try:
+        from frappe.utils import get_system_timezone
+
+        return valid_timezone(get_system_timezone())
+    except Exception:  # noqa: BLE001 - outside a site, or older Frappe
+        pass
+    try:
+        return valid_timezone(frappe.db.get_single_value("System Settings", "time_zone"))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @dataclass
@@ -212,6 +234,8 @@ def build_table_schema(
     include_soft_delete: bool = False,
     exclude_fields: "set[str] | frozenset[str] | None" = None,
     is_child: bool = False,
+    partition_by_creation: bool = False,
+    timezone: str | None = "system",
 ) -> TableSchema:
     """Build the desired :class:`TableSchema` from a DocType's metadata.
 
@@ -229,6 +253,11 @@ def build_table_schema(
             excluded regardless of this argument.
         is_child: When ``True`` the parent/parenttype/parentfield link columns
             are added so the synced child table can be joined to its parent.
+        partition_by_creation: Partition by creation month instead of a
+            single partition (applies when the table is created).
+        timezone: Time zone declared on DateTime columns of a new table.
+            ``"system"`` (default) uses Frappe's system time zone; ``None``
+            declares none.
 
     Returns:
         A populated :class:`TableSchema`.
@@ -236,6 +265,7 @@ def build_table_schema(
     meta = frappe.get_meta(doctype)
     columns: list[ColumnDefinition] = []
     seen: set[str] = set()
+    tz = system_timezone() if timezone == "system" else valid_timezone(timezone)
 
     # Normalise the exclusion set; protected columns can never be dropped.
     excluded = {f.strip() for f in (exclude_fields or set()) if f and f.strip()}
@@ -251,7 +281,7 @@ def build_table_schema(
         columns.append(
             ColumnDefinition(
                 name=fieldname,
-                clickhouse_type=ch_type,
+                clickhouse_type=with_timezone(ch_type, tz),
                 frappe_fieldtype=frappe_type,
                 nullable=nullable,
             )
@@ -270,14 +300,22 @@ def build_table_schema(
         # Password fieldtype always holds secret material - never mirror it.
         if getattr(df, "fieldtype", None) == "Password":
             continue
-        columns.append(build_column_definition(df))
+        col = build_column_definition(df)
+        if df.fieldtype == "Datetime":
+            col = ColumnDefinition(
+                name=col.name,
+                clickhouse_type=with_timezone(col.clickhouse_type, tz),
+                frappe_fieldtype=col.frappe_fieldtype,
+                nullable=col.nullable,
+            )
+        columns.append(col)
         seen.add(df.fieldname)
 
     # 3. Engine-managed markers.
     columns.append(
         ColumnDefinition(
             name=SYNC_TIMESTAMP_COLUMN,
-            clickhouse_type="DateTime64(3)",
+            clickhouse_type=with_timezone("DateTime64(3)", tz),
             frappe_fieldtype="Datetime",
             nullable=False,
         )
@@ -308,7 +346,7 @@ def build_table_schema(
     # Plain MergeTree keeps the original composite key and month partitioning.
     if resolved_engine.startswith("ReplacingMergeTree"):
         order_by: tuple[str, ...] = ("name",)
-        partition_by = "tuple()"
+        partition_by = CREATION_PARTITION_EXPRESSION if partition_by_creation else "tuple()"
     else:
         order_by = KEY_COLUMNS
         partition_by = "toYYYYMM(modified)"
@@ -369,6 +407,23 @@ def invalidate_schema_cache(table_name: str | None = None) -> None:
         _SCHEMA_CACHE.pop(key, None)
 
 
+def partition_key(client: "Client", database: str, table_name: str) -> str:
+    """The live table's partition key expression ('' if unpartitioned)."""
+    result = client.query(
+        "SELECT partition_key FROM system.tables "
+        "WHERE database = {db:String} AND name = {tbl:String}",
+        parameters={"db": database, "tbl": table_name},
+    )
+    rows = result.result_rows or []
+    return str(rows[0][0] or "") if rows else ""
+
+
+def is_creation_partitioned(client: "Client", database: str, table_name: str) -> bool:
+    """``True`` if the live table is partitioned by creation month."""
+    key = partition_key(client, database, table_name).replace("`", "").replace(" ", "")
+    return "toYYYYMM(" in key and "creation" in key
+
+
 def table_exists(client: "Client", database: str, table_name: str) -> bool:
     """Return ``True`` if the physical table already exists in ClickHouse."""
     result = client.query(
@@ -415,6 +470,11 @@ def ensure_table(
     invalidate_schema_cache(schema.table_name)
     frappe.logger("clickhouse_sync").info(f"Created ClickHouse table {schema.table_name}")
     return True
+
+
+def _comparable(clickhouse_type: str) -> str:
+    """Base type without ``Nullable`` and without a DateTime time zone."""
+    return strip_timezone(_base_type(clickhouse_type))
 
 
 def _base_type(clickhouse_type: str) -> str:
@@ -497,7 +557,10 @@ def diff_schema(
             continue
 
         desired_type = col.ddl.split(" ", 1)[1]  # strip the `name` prefix
-        if _base_type(live_type) == _base_type(desired_type):
+        if _comparable(live_type) == _comparable(desired_type):
+            # Same type. A time zone difference alone (a table created before
+            # time zones were declared) is not migrated: rewriting the column
+            # would not change the stored instants.
             continue
         if _can_widen(live_type, desired_type):
             diff.widened.append((col.name, live_type, desired_type))
@@ -607,10 +670,10 @@ def insert_columns(
         live_type = live.get(col.name)
         if live_type is None:
             continue
-        desired_base = _base_type(col.ddl.split(" ", 1)[1])
+        desired_base = _comparable(col.ddl.split(" ", 1)[1])
         fieldtype = (
             col.frappe_fieldtype
-            if _base_type(live_type) == desired_base
+            if _comparable(live_type) == desired_base
             else fieldtype_for_clickhouse_type(live_type)
         )
         columns.append(

@@ -52,6 +52,10 @@ WRITE_THROTTLE_SECONDS = 1.0
 
 # A running sync with no heartbeat for this long is shown as "Stalled".
 STALE_AFTER_SECONDS = 600
+# Phases that are one long ClickHouse statement (no batch to report between)
+# get a longer allowance before they count as stalled.
+LONG_PHASE_PREFIXES = ("optimizing", "reconciling")
+STALE_AFTER_LONG_PHASE_SECONDS = 3 * 3600
 
 # Rate and ETA are only shown once this much work has been observed, so a
 # single fast first batch does not produce a misleading estimate.
@@ -85,8 +89,11 @@ def _forget_local(cache: Any, key: str) -> None:
             pass
 
 
-def _read(key: str) -> Any:
-    """Read a fresh value from Redis (never from the per-request copy)."""
+def read_fresh(key: str) -> Any:
+    """Read a fresh value from Redis (never from the per-request copy).
+
+    Returns ``None`` (and logs) when Redis cannot be read.
+    """
     try:
         cache = frappe.cache()
         _forget_local(cache, key)
@@ -136,7 +143,7 @@ def mark_queued(config_name: str, doctype: str | None, trigger: str, mode: str |
     An existing Running record is left alone: a duplicate enqueue of a running
     configuration is dropped by the queue's de-duplication.
     """
-    current = _read(LIVE_PREFIX + config_name)
+    current = read_fresh(LIVE_PREFIX + config_name)
     if current and current.get("status") == "Running":
         return
     # Re-queueing a job that is still waiting keeps its original queue time:
@@ -168,7 +175,7 @@ class LiveRun:
     def __init__(self, config_name: str, doctype: str | None, trigger: str, mode: str | None, max_attempts: int) -> None:
         self.key = LIVE_PREFIX + config_name
         self._last_write = 0.0
-        previous = _read(self.key) or {}
+        previous = read_fresh(self.key) or {}
         now = now_datetime()
         self.state: dict[str, Any] = {
             "configuration": config_name,
@@ -292,19 +299,19 @@ def clear(config_name: str) -> None:
 # Reads (called by the dashboard API)
 # --------------------------------------------------------------------------- #
 def get_live(config_name: str) -> dict[str, Any] | None:
-    return _read(LIVE_PREFIX + config_name)
+    return read_fresh(LIVE_PREFIX + config_name)
 
 
 def get_last_run(config_name: str) -> dict[str, Any] | None:
-    return _read(LAST_RUN_PREFIX + config_name)
+    return read_fresh(LAST_RUN_PREFIX + config_name)
 
 
 def get_run_detail(log_name: str) -> dict[str, Any] | None:
-    return _read(RUN_DETAIL_PREFIX + log_name)
+    return read_fresh(RUN_DETAIL_PREFIX + log_name)
 
 
 def get_counts(config_name: str) -> dict[str, Any] | None:
-    return _read(COUNTS_PREFIX + config_name)
+    return read_fresh(COUNTS_PREFIX + config_name)
 
 
 def set_counts(config_name: str, counts: dict[str, Any], ttl: int) -> None:
@@ -326,10 +333,16 @@ def derive_metrics(state: dict[str, Any], now: datetime | None = None) -> dict[s
     elapsed = (now - started).total_seconds() if started else 0.0
     out["elapsed_seconds"] = round(max(elapsed, 0.0), 1)
     out["heartbeat_age_seconds"] = round((now - heartbeat).total_seconds(), 1) if heartbeat else None
+    phase = str(state.get("phase") or "")
+    allowance = (
+        STALE_AFTER_LONG_PHASE_SECONDS
+        if phase.startswith(LONG_PHASE_PREFIXES)
+        else STALE_AFTER_SECONDS
+    )
     out["stalled"] = bool(
         state.get("status") == "Running"
         and out["heartbeat_age_seconds"] is not None
-        and out["heartbeat_age_seconds"] > STALE_AFTER_SECONDS
+        and out["heartbeat_age_seconds"] > allowance
     )
 
     read = int(state.get("rows_read") or 0)
