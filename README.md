@@ -22,25 +22,96 @@ and Telegram can alert you to failures.
 
 ---
 
+## At a glance
+
+```mermaid
+flowchart LR
+    subgraph site["Your ERPNext / Frappe site"]
+        DB[("MariaDB<br/>live ERP data")]
+        APP["ClickHouse Sync app<br/>schedule, dashboard, alerts"]
+    end
+    CH[("ClickHouse<br/>reporting copy")]
+    BI["Superset, ai_insights,<br/>SQL reports"]
+    TG["Telegram"]
+    DB -->|"new and changed records"| APP
+    APP -->|"batches of rows"| CH
+    BI -->|"fast queries"| CH
+    APP -.->|"failure alerts"| TG
+```
+
+Your users keep working in ERPNext as usual. Reports read the ClickHouse
+copy, which is a few minutes behind the live data.
+
 ## Contents
 
+**Using the app**
+
+- [Getting started](#getting-started): install, connect, sync your first DocType
+- [Key terms](#key-terms): the words used in the app, in plain language
 - [What it does](#what-it-does)
-- [How a sync works](#how-a-sync-works)
+- [How a sync works](#how-a-sync-works) (with diagrams)
+- [Choosing settings](#choosing-settings): which options to pick for each DocType
 - [Monitoring dashboard](#monitoring-dashboard)
 - [Telegram alerts](#telegram-alerts)
-- [Install](#install)
-- [Configuration](#configuration)
-- [Day-to-day operation](#day-to-day-operation)
 - [Querying the warehouse](#querying-the-warehouse)
-- [Security](#security)
-- [Testing](#testing)
-- [Code layout](#code-layout)
-- [API](#api)
-- [Known limitations](#known-limitations)
+- [Day-to-day operation](#day-to-day-operation)
 - [Troubleshooting](#troubleshooting)
+
+**Running and maintaining it**
+
+- [Install and update](#install-and-update)
+- [Settings reference](#settings-reference)
+- [Security](#security)
+- [Known limitations](#known-limitations)
+
+**For developers**
+
+- [For developers](#for-developers): tests, code layout, API
 - [Changelog](#changelog)
 
 ---
+
+## Getting started
+
+You need a ClickHouse server and a System Manager login on your Frappe site.
+
+1. **Install the app** on your bench. See [Install and update](#install-and-update).
+2. **Connect to ClickHouse.** In Desk, open **ClickHouse Settings**. Enter the
+   host, port, database, username and password, tick **Secure** if ClickHouse
+   is on another server, save, and press **Test Connection**. It should report
+   OK.
+3. **Choose a DocType to copy.** Create a new **ClickHouse Sync
+   Configuration**. Pick the **Source DocType** (for example *Sales Invoice*),
+   keep **Sync Mode** on *Incremental*, choose a **Delete Strategy** (see
+   [Choosing settings](#choosing-settings)), tick **Sync Child Tables** if you
+   need line items, and save.
+4. **Run the first sync.** Open the dashboard at
+   `/app/clickhouse-sync-dashboard` and press **Incremental** on the DocType's
+   row. The first run copies every record, so a large DocType can take a while;
+   after that, each run copies only what changed.
+5. **Check it worked.** On the dashboard the run shows *Completed*, and the
+   DocType's *Difference* column is 0 or close to it.
+6. **Query the copy.** The table is named `tab_` + the DocType in lower case,
+   for example `tab_sales_invoice`. See [Querying the warehouse](#querying-the-warehouse).
+
+From then on the scheduler keeps it up to date by itself. Optionally, set up
+[Telegram alerts](#telegram-alerts) so you hear about failures.
+
+## Key terms
+
+| Term | What it means |
+| --- | --- |
+| **Warehouse** | The ClickHouse database that holds the copy. |
+| **Configuration** | One *ClickHouse Sync Configuration* document per DocType you copy. It holds that DocType's settings. |
+| **Incremental sync** | Copies only records created or changed since the last sync. The normal mode. |
+| **Full sync** | Reads every record again. Slower; use it to repair or for DocTypes changed outside Frappe. |
+| **Sync position (cursor)** | The point in time up to which records have been copied. Shown as *Last Sync Timestamp*. |
+| **Overlap (Cursor Safety Lag)** | Each incremental run re-reads a few minutes before the sync position, so records saved at the last moment are never missed. |
+| **Batch** | A group of records read and written together (25,000 by default). Progress is saved after each batch. |
+| **Soft Delete / Hard Delete** | When a document is deleted in Frappe, Soft Delete keeps its row in the warehouse with a deleted flag; Hard Delete removes the row. |
+| **`FINAL`** | A word added to ClickHouse queries so each record appears once, in its latest version. |
+| **Sync Log** | One record per run: when it ran, how many records, and the error if it failed. |
+| **Scheduler tick** | Frappe's scheduler checks every 15 minutes which DocTypes are due for a sync. |
 
 ## What it does
 
@@ -81,27 +152,56 @@ and Telegram can alert you to failures.
 
 ## How a sync works
 
-```
-scheduler (every 15 min, each configuration when its Sync Interval is due)
-dashboard / form button (any time)
-        │  enqueue (long queue, one job per configuration at a time)
-        ▼
-run_sync(config)
-        ├─ ensure ClickHouse table, add new columns, widen types safely
-        ├─ child tables first (if enabled)
-        ├─ read source in batches  ──►  insert batch into ClickHouse
-        │        └─ after each batch: save position, update live progress
-        ├─ reconcile deletes (full mode, or if enabled for incremental)
-        ├─ on success: move cursor to the run's start time
-        └─ write ClickHouse Sync Log, send alert if configured
+Every sync follows the same steps. A run either finishes completely or stops
+at the last batch that worked; the next run continues from there.
 
-document deleted in Frappe ──► (after commit) queued in Redis
-        ──► background job on the short queue, within ~5 min
-        ──► one delete statement per DocType per batch in ClickHouse
+```mermaid
+flowchart TD
+    A["Scheduler tick every 15 min,<br/>or a Sync button"] --> B{"Is this DocType due?<br/>Sync Interval"}
+    B -->|no| Z["Wait for the next tick"]
+    B -->|yes| C["Queue one job<br/>never two at once per DocType"]
+    C --> D["Create or update the ClickHouse table"]
+    D --> E["Copy child tables, if enabled"]
+    E --> F["Read the next batch of changed records"]
+    F --> G["Write the batch to ClickHouse<br/>and save the position"]
+    G --> H{"More records?"}
+    H -->|yes| F
+    H -->|no| I["Check for deleted records<br/>Full sync, or if enabled"]
+    I --> J["Move the position to the run's start time"]
+    J --> K["Write the Sync Log<br/>and alert if it failed"]
+    G -.->|"error"| R{"Temporary error?<br/>network, server busy"}
+    R -->|"yes: wait, then retry"| F
+    R -->|"no: data or settings problem"| K
 ```
 
-**The cursor.** `last_sync_timestamp` on the configuration is the sync
-position. Each incremental run reads records with
+**Deletes** take a separate, shorter path. Nothing is sent to ClickHouse while
+the user is deleting, so a delete Frappe refuses never reaches the warehouse,
+and a ClickHouse outage never slows down the ERP:
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant F as Frappe
+    participant Q as Delete queue (Redis)
+    participant J as Background job
+    participant C as ClickHouse
+    U->>F: Delete a document
+    F->>F: Check links. If refused, nothing else happens
+    F->>F: Commit the delete
+    F->>Q: Queue the document name
+    Note over Q,J: within about 5 minutes
+    J->>Q: Take the queued names
+    J->>F: Skip any document restored since
+    J->>C: One delete statement per DocType
+```
+
+Anything the queue misses (for example after a Redis restart) is caught when
+deleted records are checked during a sync.
+
+### The sync position
+
+`last_sync_timestamp` on the configuration is the sync position, also called
+the cursor. Each incremental run reads records with
 `cursor − overlap ≤ modified ≤ run start`, ordered by `modified, name`. The
 overlap is the configuration's *Cursor Safety Lag* (5 minutes by default).
 
@@ -119,6 +219,25 @@ them up.
 
 **Full mode** reads the table in primary-key order and only moves the cursor
 after the whole run succeeds.
+
+## Choosing settings
+
+Start with the defaults; change a setting only when one of these applies.
+
+| Your situation | What to set |
+| --- | --- |
+| Most DocTypes (invoices, orders, entries) | **Sync Mode** Incremental, **Sync Interval** 15 |
+| A large DocType that changes rarely (items, customers, price lists) | Incremental, **Sync Interval** 60 to 1440 (daily) |
+| Records are changed by direct SQL or imports that don't update `modified` | **Sync Mode** Full with a long **Sync Interval**, or an occasional manual Full sync |
+| You want deleted documents kept for history | **Delete Strategy** Soft Delete, and filter `_ch_is_deleted = 0` in reports |
+| The warehouse must match the ERP exactly | **Delete Strategy** Hard Delete |
+| Deletions don't matter for your reports | **Delete Strategy** Ignore |
+| You need line items, taxes or other grid rows | **Sync Child Tables** on |
+| A very large DocType (millions of records) | Before its first sync: **Partition By Creation Month** on; keep **Optimize Only On Full** on |
+| Long imports or slow submits run on the DocType | **Cursor Safety Lag** 900 to 3600 seconds |
+| The DocType has personal or sensitive fields | List them in **Excluded Fields** (passwords and secrets are always excluded) |
+
+Every field is described in the [Settings reference](#settings-reference).
 
 ## Monitoring dashboard
 
@@ -179,7 +298,66 @@ verify the wiring.
 An hourly check also notifies System Managers when a configuration has not
 completed a sync within **Staleness Alert Hours** (0 disables it).
 
-## Install
+## Querying the warehouse
+
+Always query with `FINAL` to get the latest version of each record. Without it
+you may briefly see an older and a newer version of a record that was just
+re-synced.
+
+```sql
+SELECT customer, sum(grand_total)
+FROM erp_warehouse.tab_sales_invoice FINAL
+WHERE docstatus = 1
+GROUP BY customer;
+```
+
+With *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. A soft delete is
+written as a new version of the row with the flag set, so `FINAL` is what
+makes the flag visible. `_ch_synced_at` records when each row was written.
+
+Tables created by this version declare Frappe's system time zone on their
+DateTime columns, so instants are correct whatever the server's OS time zone.
+Tables created earlier have no time zone: their values were written using the
+worker's OS time zone and are left as they are, so old and new rows agree.
+
+## Day-to-day operation
+
+| Task | How |
+| --- | --- |
+| Sync one DocType now | Dashboard → row → **Incremental** or **Full**, or **Sync Now** on the configuration form |
+| Sync everything | Dashboard → **Incremental Sync (All)** or **Start → Full Sync (All)** |
+| Stop a sync | Dashboard → **Stop** on its card or row, or **Stop All** |
+| Retry what failed | Dashboard → **Start → Retry Failed**, or **Retry** in an error report |
+| Re-copy a DocType from scratch | Configuration form → **Reset Cursor**, then Sync Now (or run a Full sync from the dashboard) |
+| Check source and warehouse agree | Dashboard → DocTypes → *Difference* column; menu → **Recount Records** for fresh counts |
+| Investigate a failure | Dashboard → Errors → **Details**, or the Failed Syncs report |
+| Sync a large DocType less often | Configuration form → **Sync Interval (Minutes)**, for example 1440 for daily |
+| Apply queued deletes now | `bench --site <site> execute clickhouse_sync.tasks.flush_pending_deletes` |
+
+**After upgrading from 1.7.0:** run **Reset Cursor** and then **Sync Now** on
+each incremental configuration once. Earlier versions could skip records
+after an interrupted run (see the changelog); this re-copies them. Run large
+DocTypes outside working hours.
+
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+| --- | --- |
+| Dashboard looks unstyled or shows stray `<div …>` text | The browser is running a cached old script. Avatar menu → **Reload**, or open the page in a private window. Check the code is deployed: `grep -c chsync-dash-style clickhouse_sync/clickhouse_warehouse/page/clickhouse_sync_dashboard/clickhouse_sync_dashboard.js` prints 1 or more. |
+| "ClickHouse unreachable" | Check host, port and Secure in ClickHouse Settings, and that the server's HTTP interface is reachable from the bench host. |
+| Syncs stay *Queued* | No background worker is running the `long` queue. In development keep `bench start` running; in production check `sudo supervisorctl status`. |
+| Stop does nothing | The Redis cache isn't reachable (check `redis-cli -p <port> ping` using the `redis_cache` port in `sites/common_site_config.json`). |
+| Warehouse count higher than source | Deletes not propagated: the Delete Strategy is *Ignore*, documents were renamed, or no worker runs the `short` queue (check `sudo supervisorctl status`). Run a Full sync with Soft or Hard Delete to catch up. |
+| A DocType syncs less often than every 15 minutes | Its **Sync Interval (Minutes)** is longer, or **Scheduler Enabled** is off. Manual runs from the dashboard are not affected. |
+| Old Sync Logs disappeared | The daily cleanup removed logs older than **Log Retention Days**. Set it to 0 to keep every log. |
+| A Sync Manager can't edit ClickHouse Settings | By design: only System Managers can. Changing host, port, user or TLS also asks for the password again. |
+| "You need read permission on … to sync it" | The person saving the configuration can't read that DocType in Frappe. A user who can should save it. |
+| Run message says "value(s) could not be converted" | Source values that don't fit the column type, such as text in an Int field, were written as empty. Fix the source data or the field type. |
+| Warehouse count lower than source | Records not yet copied (see *Pending*), or lost by a version before this release: Reset Cursor and Sync Now. |
+| Run fails with category *Data* | A value ClickHouse can't store in its column type. **Details** shows the message and the records in the failed batch. |
+| `git push` says password authentication is not supported | Use a GitHub personal access token as the password, or SSH. |
+
+## Install and update
 
 ```bash
 cd ~/frappe-bench
@@ -231,7 +409,7 @@ commit and repeat the same steps; run
 `bench --site <site> execute clickhouse_sync.tasks.flush_pending_deletes`
 first so no queued delete is left behind.
 
-## Configuration
+## Settings reference
 
 ### 1. ClickHouse Settings
 
@@ -279,47 +457,6 @@ use the dashboard, start and stop syncs and read logs. Only **System Manager**
 can edit ClickHouse Settings. Saving a configuration requires read permission
 on its Source DocType.
 
-## Day-to-day operation
-
-| Task | How |
-| --- | --- |
-| Sync one DocType now | Dashboard → row → **Incremental** or **Full**, or **Sync Now** on the configuration form |
-| Sync everything | Dashboard → **Incremental Sync (All)** or **Start → Full Sync (All)** |
-| Stop a sync | Dashboard → **Stop** on its card or row, or **Stop All** |
-| Retry what failed | Dashboard → **Start → Retry Failed**, or **Retry** in an error report |
-| Re-copy a DocType from scratch | Configuration form → **Reset Cursor**, then Sync Now (or run a Full sync from the dashboard) |
-| Check source and warehouse agree | Dashboard → DocTypes → *Difference* column; menu → **Recount Records** for fresh counts |
-| Investigate a failure | Dashboard → Errors → **Details**, or the Failed Syncs report |
-| Sync a large DocType less often | Configuration form → **Sync Interval (Minutes)**, for example 1440 for daily |
-| Apply queued deletes now | `bench --site <site> execute clickhouse_sync.tasks.flush_pending_deletes` |
-
-**After upgrading from 1.7.0:** run **Reset Cursor** and then **Sync Now** on
-each incremental configuration once. Earlier versions could skip records
-after an interrupted run (see the changelog); this re-copies them. Run large
-DocTypes outside working hours.
-
-## Querying the warehouse
-
-Always query with `FINAL` to get the latest version of each record. Without it
-you may briefly see an older and a newer version of a record that was just
-re-synced.
-
-```sql
-SELECT customer, sum(grand_total)
-FROM erp_warehouse.tab_sales_invoice FINAL
-WHERE docstatus = 1
-GROUP BY customer;
-```
-
-With *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. A soft delete is
-written as a new version of the row with the flag set, so `FINAL` is what
-makes the flag visible. `_ch_synced_at` records when each row was written.
-
-Tables created by this version declare Frappe's system time zone on their
-DateTime columns, so instants are correct whatever the server's OS time zone.
-Tables created earlier have no time zone: their values were written using the
-worker's OS time zone and are left as they are, so old and new rows agree.
-
 ## Security
 
 - Every API method checks for the System Manager or ClickHouse Sync Manager
@@ -336,70 +473,6 @@ worker's OS time zone and are left as they are, so old and new rows agree.
   can query the ClickHouse database can read every synced DocType. Give BI
   tools a read-only ClickHouse user limited to the warehouse database.
 - Use **Secure** (TLS) when ClickHouse is on another host.
-
-## Testing
-
-```bash
-# On a bench (includes tests that need Frappe):
-bench --site <site> set-config allow_tests true      # test/staging sites only
-bench --site <site> run-tests --app clickhouse_sync
-
-# Without a bench, from the app folder (Python 3.10+):
-python -m unittest discover -s clickhouse_sync/tests -t .
-```
-
-The engine and dashboard tests run the real sync code against in-memory
-stand-ins (`tests/_fakes.py`): the source database is SQLite executing the
-engine's actual SQL, and ClickHouse and Redis are simulated. They cover
-cursor resume after failure at every batch, edits during a run, late commits,
-200 randomised histories of edits / failures / cancels, retries and error
-classification, child tables, cancellation, and every dashboard endpoint
-including role checks. No ClickHouse server is needed. Don't run tests on a
-production site.
-
-## Code layout
-
-```
-clickhouse_sync/
-├── clickhouse/
-│   ├── sync_engine.py     # run_sync: read, insert, cursor, retries, deletes, logging
-│   ├── live_status.py     # live run state in Redis for the dashboard
-│   ├── connection.py      # cached clickhouse-connect client, health check
-│   ├── schema.py          # table DDL, schema reconciliation, field exclusion
-│   ├── type_mapping.py    # Frappe field type -> ClickHouse type, value coercion
-│   ├── exceptions.py      # error types, transient/permanent classification, categories
-│   ├── warehouse_stats.py # table sizes from system.parts (shared by API, dashboard, report)
-│   └── alerts.py          # Telegram messages
-├── api/
-│   ├── api.py             # stable endpoints for the desk script, forms, cards, other apps
-│   └── dashboard.py       # dashboard endpoints
-├── tasks.py               # scheduler and background-job entry points
-├── hooks.py               # scheduler events, after_delete hook, assets, fixtures
-├── clickhouse_warehouse/  # module: DocTypes, dashboard page, reports, workspace
-└── tests/
-```
-
-## API
-
-All methods are whitelisted under `clickhouse_sync.api` and need one of the
-two roles.
-
-| Method | HTTP | Purpose |
-| --- | --- | --- |
-| `dashboard.overview(days=7)` | GET | Everything the dashboard shows |
-| `dashboard.live()` | GET | Queued and running syncs only |
-| `dashboard.error_detail(log)` | GET | Full report for one failed run |
-| `dashboard.start_sync(configuration, mode=None)` | POST | Queue one sync; `mode` = `Full` or `Incremental` for a one-off run |
-| `dashboard.start_all(mode=None)` | POST | Queue every enabled configuration |
-| `dashboard.retry_failed()` | POST | Queue configurations whose latest run failed |
-| `dashboard.stop_sync(configuration)` / `dashboard.stop_all()` | POST | Stop after the current batch |
-| `dashboard.recount(configuration=None)` | POST | Recompute record counts now |
-| `api.sync_now(configuration)`, `api.sync_all()`, `api.cancel_sync(configuration)`, `api.test_connection()`, `api.schema_status(configuration)`, `api.table_status()`, `api.analytics(days)` | any | Used by the configuration form and the earlier dashboard |
-
-From Python, `clickhouse_sync.clickhouse.sync_engine.run_sync(config_name,
-trigger="Manual", mode=None)` runs a sync in the current process and returns
-the result. `clickhouse_sync.clickhouse.connection.get_client()` returns a
-ClickHouse client and is reused by `ai_insights`.
 
 ## Known limitations
 
@@ -432,30 +505,80 @@ ClickHouse client and is reused by `ai_insights`.
 - Very large initial loads in Incremental mode read in `modified` order,
   which is slower than a Full-mode pass, but they can resume.
 
-## Troubleshooting
+## For developers
 
-| Symptom | Likely cause and fix |
-| --- | --- |
-| Dashboard looks unstyled or shows stray `<div …>` text | The browser is running a cached old script. Avatar menu → **Reload**, or open the page in a private window. Check the code is deployed: `grep -c chsync-dash-style clickhouse_sync/clickhouse_warehouse/page/clickhouse_sync_dashboard/clickhouse_sync_dashboard.js` prints 1 or more. |
-| "ClickHouse unreachable" | Check host, port and Secure in ClickHouse Settings, and that the server's HTTP interface is reachable from the bench host. |
-| Syncs stay *Queued* | No background worker is running the `long` queue. In development keep `bench start` running; in production check `sudo supervisorctl status`. |
-| Stop does nothing | The Redis cache isn't reachable (check `redis-cli -p <port> ping` using the `redis_cache` port in `sites/common_site_config.json`). |
-| Warehouse count higher than source | Deletes not propagated: the Delete Strategy is *Ignore*, documents were renamed, or no worker runs the `short` queue (check `sudo supervisorctl status`). Run a Full sync with Soft or Hard Delete to catch up. |
-| A DocType syncs less often than every 15 minutes | Its **Sync Interval (Minutes)** is longer, or **Scheduler Enabled** is off. Manual runs from the dashboard are not affected. |
-| Old Sync Logs disappeared | The daily cleanup removed logs older than **Log Retention Days**. Set it to 0 to keep every log. |
-| A Sync Manager can't edit ClickHouse Settings | By design: only System Managers can. Changing host, port, user or TLS also asks for the password again. |
-| "You need read permission on … to sync it" | The person saving the configuration can't read that DocType in Frappe. A user who can should save it. |
-| Run message says "value(s) could not be converted" | Source values that don't fit the column type, such as text in an Int field, were written as empty. Fix the source data or the field type. |
-| Warehouse count lower than source | Records not yet copied (see *Pending*), or lost by a version before this release: Reset Cursor and Sync Now. |
-| Run fails with category *Data* | A value ClickHouse can't store in its column type. **Details** shows the message and the records in the failed batch. |
-| `git push` says password authentication is not supported | Use a GitHub personal access token as the password, or SSH. |
+Background for people changing the app's code.
+
+### Testing
+
+```bash
+# On a bench (includes tests that need Frappe):
+bench --site <site> set-config allow_tests true      # test/staging sites only
+bench --site <site> run-tests --app clickhouse_sync
+
+# Without a bench, from the app folder (Python 3.10+):
+python -m unittest discover -s clickhouse_sync/tests -t .
+```
+
+The engine and dashboard tests run the real sync code against in-memory
+stand-ins (`tests/_fakes.py`): the source database is SQLite executing the
+engine's actual SQL, and ClickHouse and Redis are simulated. They cover
+cursor resume after failure at every batch, edits during a run, late commits,
+200 randomised histories of edits / failures / cancels, retries and error
+classification, child tables, cancellation, and every dashboard endpoint
+including role checks. No ClickHouse server is needed. Don't run tests on a
+production site.
+
+### Code layout
+
+```
+clickhouse_sync/
+├── clickhouse/
+│   ├── sync_engine.py     # run_sync: read, insert, cursor, retries, deletes, logging
+│   ├── live_status.py     # live run state in Redis for the dashboard
+│   ├── connection.py      # cached clickhouse-connect client, health check
+│   ├── schema.py          # table DDL, schema reconciliation, field exclusion
+│   ├── type_mapping.py    # Frappe field type -> ClickHouse type, value coercion
+│   ├── exceptions.py      # error types, transient/permanent classification, categories
+│   ├── warehouse_stats.py # table sizes from system.parts (shared by API, dashboard, report)
+│   └── alerts.py          # Telegram messages
+├── api/
+│   ├── api.py             # stable endpoints for the desk script, forms, cards, other apps
+│   └── dashboard.py       # dashboard endpoints
+├── tasks.py               # scheduler and background-job entry points
+├── hooks.py               # scheduler events, after_delete hook, assets, fixtures
+├── clickhouse_warehouse/  # module: DocTypes, dashboard page, reports, workspace
+└── tests/
+```
+
+### API
+
+All methods are whitelisted under `clickhouse_sync.api` and need one of the
+two roles.
+
+| Method | HTTP | Purpose |
+| --- | --- | --- |
+| `dashboard.overview(days=7)` | GET | Everything the dashboard shows |
+| `dashboard.live()` | GET | Queued and running syncs only |
+| `dashboard.error_detail(log)` | GET | Full report for one failed run |
+| `dashboard.start_sync(configuration, mode=None)` | POST | Queue one sync; `mode` = `Full` or `Incremental` for a one-off run |
+| `dashboard.start_all(mode=None)` | POST | Queue every enabled configuration |
+| `dashboard.retry_failed()` | POST | Queue configurations whose latest run failed |
+| `dashboard.stop_sync(configuration)` / `dashboard.stop_all()` | POST | Stop after the current batch |
+| `dashboard.recount(configuration=None)` | POST | Recompute record counts now |
+| `api.sync_now(configuration)`, `api.sync_all()`, `api.cancel_sync(configuration)`, `api.test_connection()`, `api.schema_status(configuration)`, `api.table_status()`, `api.analytics(days)` | any | Used by the configuration form and the earlier dashboard |
+
+From Python, `clickhouse_sync.clickhouse.sync_engine.run_sync(config_name,
+trigger="Manual", mode=None)` runs a sync in the current process and returns
+the result. `clickhouse_sync.clickhouse.connection.get_client()` returns a
+ClickHouse client and is reused by `ai_insights`.
 
 ## Changelog
 
 ### Unreleased
 
 Three rounds of fixes from a full code review (pull request #4). Upgrading:
-follow [Updating an existing install](#install); `bench migrate` adds four
+follow [Install and update](#install-and-update); `bench migrate` adds four
 fields (Log Retention Days, Sync Interval, Cursor Safety Lag, Partition By
 Creation Month). Nothing changes for existing ClickHouse tables until you opt
 in.
