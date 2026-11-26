@@ -1,12 +1,20 @@
 # ClickHouse Sync
 
-Copy ERPNext / Frappe DocTypes from MariaDB into [ClickHouse](https://clickhouse.com/)
-for fast analytical queries, with incremental and full sync, resumable runs,
-retries, delete handling, Telegram alerts and a live monitoring dashboard.
+A Frappe app that keeps a copy of your ERPNext / Frappe data in
+[ClickHouse](https://clickhouse.com/), a database built for fast reports and
+analytics.
 
-Built for organisation to move operational data out of
-MariaDB into a columnar warehouse that Superset and the `ai_insights` app can
-query without loading the production database.
+**Why.** Heavy reports, dashboards (Superset) and AI tools (the `ai_insights`
+app) slow down the MariaDB database that ERPNext itself runs on. This app
+copies the DocTypes you choose into ClickHouse and keeps them up to date, so
+those tools query the copy and the ERP stays fast.
+
+**How, in one paragraph.** For each DocType you add a *ClickHouse Sync
+Configuration*. The app creates a matching ClickHouse table and, on a schedule
+you set, copies new and changed records into it, along with child tables
+(such as invoice items) if you want them. Deleted documents are removed or
+flagged. A dashboard shows what is synced, what is running and what failed,
+and Telegram can alert you to failures.
 
 **Version:** 1.7.0 (plus the unreleased changes below) · **Frappe:** v15 ·
 **ClickHouse:** any version with the HTTP interface (tested against 26.6) ·
@@ -42,6 +50,9 @@ query without loading the production database.
 - **Incremental sync** reads only records changed since the last successful
   sync position. **Full sync** re-reads the whole table. Either can be run on
   demand from the dashboard, whatever the configuration's saved mode.
+- **Your schedule per DocType.** Each configuration has its own *Sync
+  Interval*: every 15 minutes for busy DocTypes, hourly or daily for large
+  ones that change rarely.
 - **Resumable and loss-free.** Incremental runs read records in
   `(modified, name)` order and save their position after every batch, so a
   failed, cancelled or timed-out run resumes from the last successful batch
@@ -54,35 +65,47 @@ query without loading the production database.
   incremental syncs too) reconcile anything the queue missed.
 - **Child tables** can be synced alongside their parent (one ClickHouse table
   per child DocType).
+- **Exact values.** Money is copied as exact decimals, and date-times in new
+  tables carry Frappe's time zone. A value that cannot be stored in its
+  column (for example text in a number field) is reported on the run, not
+  silently dropped.
 - **Resilient.** Transient failures (connection drops, ClickHouse memory
-  limits, too many parts, timeouts) are retried with exponential backoff;
-  permanent ones (bad data, schema problems) fail fast with a clear category.
-  Every run, including failed ones, writes a *ClickHouse Sync Log*.
+  limits, too many parts, timeouts) are retried with backoff; permanent ones
+  (bad data, schema problems, wrong password) fail fast with a clear
+  category. Every run, including failed ones, writes a *ClickHouse Sync Log*.
 - **Cancellable.** Stop a running or queued sync from the dashboard; it stops
   after the current batch and keeps its progress.
 - **Observable.** A live dashboard, four reports and Telegram alerts.
+- **Safe by default.** Password and secret fields are never copied, and only
+  System Managers can change where data is sent.
 
 ## How a sync works
 
 ```
-scheduler / dashboard / form button
-        │  enqueue (long queue, de-duplicated per configuration)
+scheduler (every 15 min, each configuration when its Sync Interval is due)
+dashboard / form button (any time)
+        │  enqueue (long queue, one job per configuration at a time)
         ▼
 run_sync(config)
-        ├─ ensure ClickHouse table, add new columns, widen types
+        ├─ ensure ClickHouse table, add new columns, widen types safely
         ├─ child tables first (if enabled)
         ├─ read source in batches  ──►  insert batch into ClickHouse
         │        └─ after each batch: save position, update live progress
         ├─ reconcile deletes (full mode, or if enabled for incremental)
         ├─ on success: move cursor to the run's start time
         └─ write ClickHouse Sync Log, send alert if configured
+
+document deleted in Frappe ──► (after commit) queued in Redis
+        ──► background job on the short queue, within ~5 min
+        ──► one delete statement per DocType per batch in ClickHouse
 ```
 
 **The cursor.** `last_sync_timestamp` on the configuration is the sync
 position. Each incremental run reads records with
-`cursor − 5 minutes ≤ modified ≤ run start`, ordered by `modified, name`.
+`cursor − overlap ≤ modified ≤ run start`, ordered by `modified, name`. The
+overlap is the configuration's *Cursor Safety Lag* (5 minutes by default).
 
-- The **5-minute overlap** catches records whose transaction committed slightly
+- The **overlap** catches records whose transaction committed slightly
   after they were stamped. Re-reading them is harmless, because ClickHouse
   keeps one version per record. The dashboard shows these as *Re-checked*.
 - Capping each run at its **start time** means an edit made while a run is in
@@ -124,8 +147,8 @@ to configurations, logs, reports and settings.
 - **Warehouse records** are `SELECT count() … FINAL` in ClickHouse, excluding
   soft-deleted rows.
 - **Pending** counts records with `modified` after the DocType's cursor. It is
-  always current; the other counts are cached for 10 minutes (menu → Recount
-  Records forces a recount).
+  at most a minute old; the other counts are cached for 10 minutes (menu →
+  Recount Records forces a recount).
 - **Synchronized %** is (source − pending) ÷ source.
 - **Failed records** are the records in batches ClickHouse rejected, summed
   over failed runs in the selected window.
@@ -135,7 +158,8 @@ to configurations, logs, reports and settings.
 The live monitor refreshes every 3 seconds while a sync is queued or running;
 the whole page every 30 seconds. Polling pauses while the page or browser tab
 is hidden. A running sync that reports no progress for 10 minutes is flagged
-*Stalled*, and as a lost worker if its job has left the queue.
+*Stalled* (3 hours while it optimizes a table or checks for deletes, which are
+single long statements), and as a lost worker if its job has left the queue.
 
 ## Telegram alerts
 
@@ -167,20 +191,45 @@ bench restart        # or restart `bench start` in development
 Python dependencies (`clickhouse-connect`, `requests`) install with the app.
 You need a ClickHouse server reachable over its HTTP interface (default port
 8123, or 8443 with TLS) and a ClickHouse user that can create tables in the
-target database.
+target database. Background workers must run the `long` queue (syncs) and the
+`short` queue (deletes).
 
-**Updating an existing install**
+**Updating an existing install.** Try it on a staging site first. Pause the
+scheduler and wait for running syncs to finish (dashboard → **Stop All**):
 
 ```bash
-cd ~/frappe-bench/apps/clickhouse_sync && git pull
 cd ~/frappe-bench
+bench --site <site> disable-scheduler
+bench --site <site> backup --with-files
+```
+
+Update the code, reinstall the package (needed since `setup.py` was removed:
+the app now installs from `pyproject.toml`), migrate and rebuild:
+
+```bash
+cd ~/frappe-bench/apps/clickhouse_sync
+git pull origin main
+cd ~/frappe-bench
+./env/bin/pip install -e apps/clickhouse_sync
 bench --site <site> migrate
+bench build --app clickhouse_sync
 bench --site <site> clear-cache
 bench restart
 ```
 
-Then reload Desk from the avatar menu → **Reload**, so the browser drops its
-cached copy of the dashboard script.
+Before turning the scheduler back on, check **ClickHouse Settings → Log
+Retention Days**: the daily cleanup deletes Sync Logs older than that (90 by
+default; 0 keeps them all). Then:
+
+```bash
+bench --site <site> enable-scheduler
+```
+
+Finally reload Desk from the avatar menu → **Reload**, so the browser drops
+its cached copy of the dashboard script. To go back, check out the previous
+commit and repeat the same steps; run
+`bench --site <site> execute clickhouse_sync.tasks.flush_pending_deletes`
+first so no queued delete is left behind.
 
 ## Configuration
 
@@ -241,6 +290,8 @@ on its Source DocType.
 | Re-copy a DocType from scratch | Configuration form → **Reset Cursor**, then Sync Now (or run a Full sync from the dashboard) |
 | Check source and warehouse agree | Dashboard → DocTypes → *Difference* column; menu → **Recount Records** for fresh counts |
 | Investigate a failure | Dashboard → Errors → **Details**, or the Failed Syncs report |
+| Sync a large DocType less often | Configuration form → **Sync Interval (Minutes)**, for example 1440 for daily |
+| Apply queued deletes now | `bench --site <site> execute clickhouse_sync.tasks.flush_pending_deletes` |
 
 **After upgrading from 1.7.0:** run **Reset Cursor** and then **Sync Now** on
 each incremental configuration once. Earlier versions could skip records
@@ -389,14 +440,36 @@ ClickHouse client and is reused by `ai_insights`.
 | "ClickHouse unreachable" | Check host, port and Secure in ClickHouse Settings, and that the server's HTTP interface is reachable from the bench host. |
 | Syncs stay *Queued* | No background worker is running the `long` queue. In development keep `bench start` running; in production check `sudo supervisorctl status`. |
 | Stop does nothing | The Redis cache isn't reachable (check `redis-cli -p <port> ping` using the `redis_cache` port in `sites/common_site_config.json`). |
-| Warehouse count higher than source | Deletes not propagated: the Delete Strategy is *Ignore*, or documents were renamed. Run a Full sync with Soft or Hard Delete. |
+| Warehouse count higher than source | Deletes not propagated: the Delete Strategy is *Ignore*, documents were renamed, or no worker runs the `short` queue (check `sudo supervisorctl status`). Run a Full sync with Soft or Hard Delete to catch up. |
+| A DocType syncs less often than every 15 minutes | Its **Sync Interval (Minutes)** is longer, or **Scheduler Enabled** is off. Manual runs from the dashboard are not affected. |
+| Old Sync Logs disappeared | The daily cleanup removed logs older than **Log Retention Days**. Set it to 0 to keep every log. |
+| A Sync Manager can't edit ClickHouse Settings | By design: only System Managers can. Changing host, port, user or TLS also asks for the password again. |
+| "You need read permission on … to sync it" | The person saving the configuration can't read that DocType in Frappe. A user who can should save it. |
+| Run message says "value(s) could not be converted" | Source values that don't fit the column type, such as text in an Int field, were written as empty. Fix the source data or the field type. |
 | Warehouse count lower than source | Records not yet copied (see *Pending*), or lost by a version before this release: Reset Cursor and Sync Now. |
 | Run fails with category *Data* | A value ClickHouse can't store in its column type. **Details** shows the message and the records in the failed batch. |
 | `git push` says password authentication is not supported | Use a GitHub personal access token as the password, or SSH. |
 
 ## Changelog
 
-### Unreleased (code review fixes, part 2)
+### Unreleased
+
+Three rounds of fixes from a full code review (pull request #4). Upgrading:
+follow [Updating an existing install](#install); `bench migrate` adds four
+fields (Log Retention Days, Sync Interval, Cursor Safety Lag, Partition By
+Creation Month). Nothing changes for existing ClickHouse tables until you opt
+in.
+
+#### Review fixes, round 3
+
+- Queued deletes for several DocTypes are no longer lost when one of them hits
+  a temporary ClickHouse error.
+- On an unmigrated `UInt8` column, integer values are kept instead of being
+  collapsed to 0/1.
+- A failure alert whose Telegram delivery failed is sent again by the next
+  digest.
+
+#### Review fixes, round 2
 
 - **Per-configuration schedule:** *Sync Interval (Minutes)* lets large
   Full-mode DocTypes run hourly or daily instead of every 15 minutes.
@@ -419,10 +492,7 @@ ClickHouse client and is reused by `ai_insights`.
 - One version number (`clickhouse_sync.__version__`) and one build system
   (`pyproject.toml`); `setup.py` removed.
 
-**Upgrade notes.** Run `bench migrate` for the three new configuration
-fields. Nothing changes for existing tables until you opt in.
-
-### Unreleased (code review fixes)
+#### Review fixes, round 1
 
 **Data correctness**
 
@@ -468,9 +538,8 @@ fields. Nothing changes for existing tables until you opt in.
   password again. Configurations require read access to the Source DocType.
 - The Telegram bot token is removed from logged and returned errors.
 
-**Upgrade notes.** Run `bench migrate` (new settings field, log indexes, the
-Running Syncs number card). Existing configurations keep their *Optimize
-Only On Full* value: turn it on for large incremental DocTypes.
+Existing configurations keep their *Optimize Only On Full* value: turn it on
+for large incremental DocTypes.
 
 ### Stage 1 fixes
 
