@@ -24,6 +24,10 @@ and Telegram can alert you to failures.
 
 ## At a glance
 
+![Animation: records are copied from ERPNext to ClickHouse in two batches; later only two edited records are copied again; reports read from ClickHouse; a deleted record is removed from the copy too.](docs/images/sync-explainer.gif)
+
+The same picture as a diagram:
+
 ```mermaid
 flowchart LR
     subgraph site["Your ERPNext / Frappe site"]
@@ -549,6 +553,9 @@ clickhouse_sync/
 ├── hooks.py               # scheduler events, after_delete hook, assets, fixtures
 ├── clickhouse_warehouse/  # module: DocTypes, dashboard page, reports, workspace
 └── tests/
+docs/images/
+├── sync-explainer.gif         # the animation at the top of this README
+└── make_sync_explainer.py     # regenerates it: python docs/images/make_sync_explainer.py
 ```
 
 ### API
