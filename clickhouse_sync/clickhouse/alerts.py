@@ -18,6 +18,7 @@ logged and swallowed - an alerting problem must never fail or delay a sync.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import frappe
@@ -27,6 +28,25 @@ if TYPE_CHECKING:
 
 _TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 _TIMEOUT = 15
+# Telegram rejects messages longer than 4096 characters.
+_MAX_MESSAGE_CHARS = 4000
+_SUCCESS_STATUSES = ("Completed", "Success")
+# Runs a person stopped on purpose are not failures worth paging about.
+_NOT_FAILURES = _SUCCESS_STATUSES + ("Cancelled",)
+LAST_DIGEST_KEY = "clickhouse_sync:last_digest_at"
+_MAX_DIGEST_WINDOW_MINUTES = 60
+_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+
+class TelegramError(Exception):
+    """A Telegram request failed. The message never contains the bot token."""
+
+
+def _redact(text: str, token: str | None = None) -> str:
+    """Remove a bot token from ``text`` (it travels in the request URL)."""
+    if token:
+        text = text.replace(token, "<redacted>")
+    return _TOKEN_RE.sub("bot<redacted>", text)
 
 # Emoji per status for an at-a-glance read on a phone.
 _STATUS_ICON = {
@@ -77,7 +97,7 @@ def _format_message(config_name: str, trigger: str, result: "SyncResult") -> str
     lines = [
         f"{icon} <b>ClickHouse Sync {result.status}</b>",
         f"Config: <b>{frappe.utils.escape_html(config_name)}</b>",
-        f"Trigger: {trigger}",
+        f"Trigger: {frappe.utils.escape_html(str(trigger))}",
         f"Rows read: {result.rows_read:,}  |  written: {result.rows_written:,}",
     ]
     if result.rows_failed:
@@ -115,23 +135,35 @@ def send_run_alert(config_name: str, trigger: str, result: "SyncResult") -> None
         token, chat_id = creds
         message = _format_message(config_name, trigger, result)
         _post(token, chat_id, message)
-    except Exception:  # noqa: BLE001 - alerting must never disrupt a sync
-        frappe.logger("clickhouse_sync").warning(
-            f"Telegram alert failed: {frappe.get_traceback()}"
-        )
+    except Exception as exc:  # noqa: BLE001 - alerting must never disrupt a sync
+        # Never log the traceback: a requests error carries the request URL,
+        # and the bot token is part of that URL.
+        frappe.logger("clickhouse_sync").warning(f"Telegram alert failed: {_redact(str(exc))}")
+
+
+def _truncate(message: str) -> str:
+    if len(message) <= _MAX_MESSAGE_CHARS:
+        return message
+    return message[: _MAX_MESSAGE_CHARS - 20].rsplit("\n", 1)[0] + "\n… (truncated)"
 
 
 def _post(token: str, chat_id: str, message: str) -> None:
+    """Send one message. Raises :class:`TelegramError` with the token removed."""
     import requests
 
-    resp = requests.post(
-        _TELEGRAM_API.format(token=token),
-        data={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
-        timeout=_TIMEOUT,
-    )
+    try:
+        resp = requests.post(
+            _TELEGRAM_API.format(token=token),
+            data={"chat_id": chat_id, "text": _truncate(message), "parse_mode": "HTML"},
+            timeout=_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raise without the token
+        raise TelegramError(
+            f"Telegram request failed: {type(exc).__name__}: {_redact(str(exc), token)}"
+        ) from None
     if resp.status_code != 200:
         frappe.logger("clickhouse_sync").warning(
-            f"Telegram returned {resp.status_code}: {resp.text[:200]}"
+            f"Telegram returned {resp.status_code}: {_redact(resp.text[:200], token)}"
         )
 
 
@@ -147,7 +179,7 @@ def send_test_alert() -> dict:
         _post(token, chat_id, "✅ <b>ClickHouse Sync</b>\nTest alert - Telegram is configured correctly.")
         return {"ok": True, "message": f"Test message sent to chat {chat_id}."}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "message": str(exc)}
+        return {"ok": False, "message": _redact(str(exc), token)}
 
 
 # --------------------------------------------------------------------------- #
@@ -165,8 +197,37 @@ def _alert_mode() -> str:
     return (_settings().get("alert_mode") or "Consolidated").strip()
 
 
-def send_batch_digest(window_minutes: int = 20) -> "dict | None":
-    """Summarise all runs in the last ``window_minutes`` into one message.
+def _digest_cutoff(window_minutes: int | None) -> "object":
+    """Start of the digest window: the end of the previous digest's window.
+
+    Fixed 20-minute windows on a 15-minute schedule overlapped, so a failure
+    could be reported twice. The window now starts where the last one ended
+    (at most an hour back, e.g. after a scheduler outage).
+    """
+    now = frappe.utils.now_datetime()
+    if window_minutes is not None:
+        return frappe.utils.add_to_date(now, minutes=-abs(window_minutes))
+    floor = frappe.utils.add_to_date(now, minutes=-_MAX_DIGEST_WINDOW_MINUTES)
+    try:
+        last = frappe.cache().get_value(LAST_DIGEST_KEY)
+        if last:
+            last = frappe.utils.get_datetime(last)
+            if last > floor:
+                return last
+    except Exception:  # noqa: BLE001
+        pass
+    return frappe.utils.add_to_date(now, minutes=-15)
+
+
+def _remember_digest(now: "object") -> None:
+    try:
+        frappe.cache().set_value(LAST_DIGEST_KEY, str(now), expires_in_sec=24 * 3600)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def send_batch_digest(window_minutes: int | None = None) -> "dict | None":
+    """Summarise the runs that ended since the previous digest into one message.
 
     Called shortly after each scheduler tick. In Consolidated mode it sends a
     single digest covering every configuration that ran, but only when at least
@@ -182,13 +243,15 @@ def send_batch_digest(window_minutes: int = 20) -> "dict | None":
         if not creds:
             return None
 
-        cutoff = frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-abs(window_minutes))
+        now = frappe.utils.now_datetime()
+        cutoff = _digest_cutoff(window_minutes)
         logs = frappe.get_all(
             "ClickHouse Sync Log",
-            filters={"creation": [">=", cutoff]},
+            filters={"creation": [">", cutoff]},
             fields=["configuration", "status", "rows_written", "rows_failed"],
             order_by="creation asc",
         )
+        _remember_digest(now)
         if not logs:
             return None
 
@@ -198,7 +261,7 @@ def send_batch_digest(window_minutes: int = 20) -> "dict | None":
             latest[row["configuration"]] = row
         runs = list(latest.values())
 
-        failures = [r for r in runs if r["status"] not in ("Completed", "Success")]
+        failures = [r for r in runs if r["status"] not in _NOT_FAILURES]
         if not failures:
             # Healthy cycle - stay silent by design.
             return {"sent": False, "reason": "no failures", "runs": len(runs)}
@@ -206,10 +269,8 @@ def send_batch_digest(window_minutes: int = 20) -> "dict | None":
         token, chat_id = creds
         _post(token, chat_id, _format_batch_message(runs, failures))
         return {"sent": True, "runs": len(runs), "failures": len(failures)}
-    except Exception:  # noqa: BLE001
-        frappe.logger("clickhouse_sync").warning(
-            f"batch digest failed: {frappe.get_traceback()}"
-        )
+    except Exception as exc:  # noqa: BLE001
+        frappe.logger("clickhouse_sync").warning(f"batch digest failed: {_redact(str(exc))}")
         return None
 
 
@@ -233,8 +294,8 @@ def send_daily_heartbeat() -> "dict | None":
             fields=["configuration", "status", "rows_written"],
         )
         total = len(logs)
-        ok = sum(1 for l in logs if l["status"] in ("Completed", "Success"))
-        failed = total - ok
+        ok = sum(1 for l in logs if l["status"] in _SUCCESS_STATUSES)
+        failed = sum(1 for l in logs if l["status"] not in _NOT_FAILURES)
         rows = sum(l["rows_written"] or 0 for l in logs)
         rate = round(ok / total * 100, 1) if total else 100.0
         icon = "✅" if failed == 0 else ("⚠️" if rate >= 90 else "❌")
@@ -249,7 +310,7 @@ def send_daily_heartbeat() -> "dict | None":
         if failed:
             bad = {}
             for l in logs:
-                if l["status"] not in ("Completed", "Success"):
+                if l["status"] not in _NOT_FAILURES:
                     bad[l["configuration"]] = bad.get(l["configuration"], 0) + 1
             named = ", ".join(f"{k} ({v})" for k, v in sorted(bad.items()))
             lines.append(f"\nFailing: {frappe.utils.escape_html(named)}")
@@ -260,16 +321,14 @@ def send_daily_heartbeat() -> "dict | None":
         token, chat_id = creds
         _post(token, chat_id, "\n".join(lines))
         return {"sent": True, "total": total, "failed": failed}
-    except Exception:  # noqa: BLE001
-        frappe.logger("clickhouse_sync").warning(
-            f"daily heartbeat failed: {frappe.get_traceback()}"
-        )
+    except Exception as exc:  # noqa: BLE001
+        frappe.logger("clickhouse_sync").warning(f"daily heartbeat failed: {_redact(str(exc))}")
         return None
 
 
 def _format_batch_message(runs: list[dict], failures: list[dict]) -> str:
     """Build the consolidated digest message for a batch with failures."""
-    ok = [r for r in runs if r["status"] in ("Completed", "Success")]
+    ok = [r for r in runs if r["status"] in _SUCCESS_STATUSES]
     total_rows = sum(r["rows_written"] or 0 for r in runs)
 
     lines = [
@@ -318,11 +377,11 @@ def send_test_digest() -> dict:
     for row in logs:
         latest[row["configuration"]] = row
     runs = list(latest.values())
-    failures = [r for r in runs if r["status"] not in ("Completed", "Success")]
+    failures = [r for r in runs if r["status"] not in _NOT_FAILURES]
 
     token, chat_id = creds
     try:
         _post(token, chat_id, _format_batch_message(runs, failures or []))
         return {"ok": True, "message": f"Test digest sent ({len(runs)} configs, {len(failures)} failing)."}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "message": str(exc)}
+        return {"ok": False, "message": _redact(str(exc), token)}

@@ -530,10 +530,10 @@ class TestParameterizedDeleteNames(unittest.TestCase):
         self.assertIn("{names:Array(String)}", reconcile_call[0])
 
         h.clickhouse.tables["tab_doc"][name] = {"name": name, "_ch_is_deleted": 0}
-        sync_engine.propagate_delete(h.DOCTYPE, name)
+        sync_engine.propagate_delete(h.DOCTYPE, [name])
         propagation_call = h.clickhouse.command_calls[-1]
-        self.assertIn("{name:String}", propagation_call[0])
-        self.assertEqual(propagation_call[1], {"name": name})
+        self.assertIn("{names:Array(String)}", propagation_call[0])
+        self.assertEqual(propagation_call[1], {"names": [name]})
         self.assertNotIn(name, h.warehouse())
 
 

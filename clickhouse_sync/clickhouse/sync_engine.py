@@ -35,6 +35,8 @@ Design notes
 
 from __future__ import annotations
 
+import json
+import random
 import socket
 import time
 import traceback
@@ -60,10 +62,11 @@ from clickhouse_sync.clickhouse.schema import (
     build_table_schema,
     ensure_table,
     get_child_doctypes,
+    insert_columns,
     reconcile_schema,
     table_name_for,
 )
-from clickhouse_sync.clickhouse.type_mapping import coerce_value
+from clickhouse_sync.clickhouse.type_mapping import coerce_value, empty_value_for
 
 if TYPE_CHECKING:  # pragma: no cover
     from clickhouse_connect.driver.client import Client
@@ -108,7 +111,10 @@ class SyncContext:
     last_sync_timestamp: datetime | None
     exclude_fields: frozenset[str] = field(default_factory=frozenset)
     optimize_after_sync: bool = True
-    optimize_only_on_full: bool = False
+    # Default ON: tables are a single partition, so OPTIMIZE FINAL rewrites
+    # the whole table - doing that on every 15-minute incremental tick is far
+    # too expensive. Query with FINAL between full syncs instead.
+    optimize_only_on_full: bool = True
     reconcile_deletes_incremental: bool = False
     sync_child_tables: bool = False
     # The cursor as it was when the run started. ``last_sync_timestamp`` moves
@@ -313,7 +319,7 @@ def build_context(
         last_sync_timestamp=last_ts,
         exclude_fields=parse_excluded_fields(config.get("excluded_fields")),
         optimize_after_sync=_coerce_flag(config.get("optimize_after_sync"), default=True),
-        optimize_only_on_full=_coerce_flag(config.get("optimize_only_on_full"), default=False),
+        optimize_only_on_full=_coerce_flag(config.get("optimize_only_on_full"), default=True),
         reconcile_deletes_incremental=_coerce_flag(
             config.get("reconcile_deletes_incremental"), default=False
         ),
@@ -552,18 +558,29 @@ def _prepare_batch(
         ``clickhouse-connect``'s :meth:`Client.insert` expects.
     """
     columns = [c.name for c in column_defs]
-    type_by_name = {c.name: c.frappe_fieldtype for c in column_defs}
+    # Per column: (fieldtype used for coercion, value to use for NULL). The
+    # NULL substitute is only set for non-nullable columns, i.e. the storage
+    # key and columns created non-nullable by older versions.
+    plan = [
+        (
+            c.name,
+            c.frappe_fieldtype,
+            None if c.nullable else empty_value_for(c.clickhouse_type),
+        )
+        for c in column_defs
+    ]
 
     data: list[list[Any]] = []
     for row in rows:
         record: list[Any] = []
-        for col in columns:
+        for col, fieldtype, empty in plan:
             if col == SYNC_TIMESTAMP_COLUMN:
                 record.append(synced_at)
             elif col == SOFT_DELETE_COLUMN:
                 record.append(0)
             else:
-                record.append(coerce_value(type_by_name.get(col, "Data"), row.get(col)))
+                value = coerce_value(fieldtype or "Data", row.get(col))
+                record.append(empty if value is None and empty is not None else value)
         data.append(record)
     return columns, data
 
@@ -632,12 +649,19 @@ def _reconcile_missing_rows(
     *,
     source_parenttype: str | None = None,
 ) -> int:
-    """Reconcile deleted or reparented rows with bounded, parameterized batches."""
+    """Reconcile deleted or reparented rows with bounded, parameterized batches.
+
+    Rows already flagged deleted (Soft Delete) are skipped: re-flagging them on
+    every run queued one ClickHouse mutation per page for every historical
+    delete, forever.
+    """
     affected = 0
     last_name = ""
 
     while True:
         clickhouse_conditions = ["`name` > {last_name:String}"]
+        if strategy == "Soft Delete":
+            clickhouse_conditions.append(f"`{SOFT_DELETE_COLUMN}` = 0")
         query_parameters: dict[str, Any] = {
             "last_name": last_name,
             "limit": DELETE_RECONCILE_BATCH_SIZE,
@@ -672,35 +696,126 @@ def _reconcile_missing_rows(
         )
         live_names = {row["name"] for row in rows}
         vanished = [name for name in names if name not in live_names]
-        if not vanished:
-            continue
-
-        mutation_conditions = []
-        mutation_parameters: dict[str, Any] = {"names": vanished}
-        if source_parenttype is not None:
-            mutation_conditions.append("`parenttype` = {source_parenttype:String}")
-            mutation_parameters["source_parenttype"] = source_parenttype
-        mutation_conditions.append("`name` IN {names:Array(String)}")
-        mutation_where = " AND ".join(mutation_conditions)
-        if strategy == "Soft Delete":
-            client.command(
-                f"ALTER TABLE `{database}`.`{table_name}` "
-                f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 "
-                f"WHERE {mutation_where}",
-                parameters=mutation_parameters,
+        if vanished:
+            _apply_delete(
+                client, database, table_name, strategy, vanished,
+                source_parenttype=source_parenttype,
             )
-        elif strategy == "Hard Delete":
-            client.command(
-                f"DELETE FROM `{database}`.`{table_name}` "
-                f"WHERE {mutation_where}",
-                parameters=mutation_parameters,
-            )
-        affected += len(vanished)
+            affected += len(vanished)
 
         if len(names) < DELETE_RECONCILE_BATCH_SIZE:
             break
 
     return affected
+
+
+def _apply_delete(
+    client: "Client",
+    database: str,
+    table_name: str,
+    strategy: str,
+    names: list[str],
+    *,
+    source_parenttype: str | None = None,
+) -> None:
+    """Issue ONE mutation that soft- or hard-deletes ``names``."""
+    if not names or strategy not in ("Soft Delete", "Hard Delete"):
+        return
+    conditions = []
+    parameters: dict[str, Any] = {"names": list(names)}
+    if source_parenttype is not None:
+        conditions.append("`parenttype` = {source_parenttype:String}")
+        parameters["source_parenttype"] = source_parenttype
+    conditions.append("`name` IN {names:Array(String)}")
+    if strategy == "Soft Delete":
+        conditions.append(f"`{SOFT_DELETE_COLUMN}` = 0")
+        client.command(
+            f"ALTER TABLE `{database}`.`{table_name}` "
+            f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 "
+            f"WHERE {' AND '.join(conditions)}",
+            parameters=parameters,
+        )
+    else:
+        client.command(
+            f"DELETE FROM `{database}`.`{table_name}` "
+            f"WHERE {' AND '.join(conditions)}",
+            parameters=parameters,
+        )
+
+
+def _reconcile_children_of_parents(
+    client: "Client",
+    child_doctype: str,
+    table_name: str,
+    database: str,
+    strategy: str,
+    parenttype: str,
+    parents: list[str],
+) -> int:
+    """Delete-check only the child rows of ``parents`` (incremental runs).
+
+    Removing a grid row, or moving it to another document, always saves the
+    parent document it came from, so the parents changed in this run's window
+    are exactly the ones whose child rows can have vanished. Comparing just
+    those keeps the cost proportional to the changes instead of scanning the
+    whole child table on every tick.
+    """
+    affected = 0
+    unique = sorted(set(p for p in parents if p))
+    for start in range(0, len(unique), DELETE_RECONCILE_BATCH_SIZE):
+        chunk = unique[start : start + DELETE_RECONCILE_BATCH_SIZE]
+        conditions = [
+            "`parenttype` = {source_parenttype:String}",
+            "`parent` IN {parents:Array(String)}",
+        ]
+        if strategy == "Soft Delete":
+            conditions.append(f"`{SOFT_DELETE_COLUMN}` = 0")
+        result = client.query(
+            f"SELECT DISTINCT `name` FROM `{database}`.`{table_name}` "
+            f"WHERE {' AND '.join(conditions)}",
+            parameters={"source_parenttype": parenttype, "parents": chunk},
+        )
+        warehouse_names = [row[0] for row in result.result_rows]
+        if not warehouse_names:
+            continue
+        # Look the rows up by NAME (not by parent): an unmerged older copy
+        # of a row that moved to another document of the same type still
+        # matches ``parent IN (...)`` in ClickHouse, and must not be deleted.
+        for w_start in range(0, len(warehouse_names), DELETE_RECONCILE_BATCH_SIZE):
+            names = warehouse_names[w_start : w_start + DELETE_RECONCILE_BATCH_SIZE]
+            placeholders = ", ".join(f"%(name_{i})s" for i in range(len(names)))
+            params: dict[str, Any] = {f"name_{i}": name for i, name in enumerate(names)}
+            params["parenttype"] = parenttype
+            rows = frappe.db.sql(
+                f"SELECT name FROM `tab{child_doctype}` "
+                f"WHERE parenttype = %(parenttype)s AND name IN ({placeholders})",
+                params,
+                as_dict=True,
+            )
+            live_names = {row["name"] for row in rows}
+            vanished = [name for name in names if name not in live_names]
+            _apply_delete(
+                client, database, table_name, strategy, vanished,
+                source_parenttype=parenttype,
+            )
+            affected += len(vanished)
+    return affected
+
+
+def _parents_changed_in_window(ctx: SyncContext, upper: datetime) -> list[str]:
+    """Names of parent documents modified inside this incremental window."""
+    lower = incremental_lower_bound(ctx)
+    params: dict[str, Any] = {"upper": upper}
+    condition = "modified <= %(upper)s"
+    if lower is not None:
+        condition += " AND modified >= %(lower)s"
+        params["lower"] = lower
+    rows = frappe.db.sql(
+        f"SELECT name FROM `tab{ctx.doctype}` WHERE {condition}",
+        params,
+        as_dict=True,
+    )
+    return [row["name"] for row in rows]
 
 
 # --------------------------------------------------------------------------- #
@@ -721,6 +836,9 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     live.update(force=True, phase="checking schema")
     ensure_table(client, ctx.schema, database, auto_create=ctx.auto_create)
     reconcile_schema(client, ctx.schema, database, auto_update=ctx.auto_update)
+    # Insert into the columns the live table actually has, converted for
+    # their live types (an unmigratable type change must not fail inserts).
+    column_defs = insert_columns(client, ctx.schema, database)
 
     # ``watermark`` is the single point in time this run is "as of". It is the
     # upper bound for incremental reads, the version stamped on every row
@@ -741,8 +859,7 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
         live.update(force=True, child_rows_written=child_written)
 
     # 3. Stream + insert parent rows.
-    fields = _source_field_order(ctx.schema)
-    column_defs = ctx.schema.columns
+    fields = [c.name for c in column_defs if c.name not in (SYNC_TIMESTAMP_COLUMN, SOFT_DELETE_COLUMN)]
     live.update(force=True, phase="counting")
     total = count_source_rows(ctx, watermark)
     reporter = ProgressReporter(ctx.config_name, total, live)
@@ -976,22 +1093,31 @@ def _sync_one_child(
     )
     ensure_table(client, child_schema, database, auto_create=ctx.auto_create)
     reconcile_schema(client, child_schema, database, auto_update=ctx.auto_update)
+    column_defs = insert_columns(client, child_schema, database)
 
     managed = {SYNC_TIMESTAMP_COLUMN, SOFT_DELETE_COLUMN}
     valid = set(frappe.get_meta(child_doctype).get_valid_columns())
-    fields = [
-        c.name for c in child_schema.columns if c.name not in managed and c.name in valid
-    ]
+    fields = [c.name for c in column_defs if c.name not in managed and c.name in valid]
     if "name" not in fields:
         fields.insert(0, "name")
+    # ``parent`` and ``modified`` drive the keyset and the delete check.
+    for required in ("modified", "parent"):
+        if required in valid and required not in fields:
+            fields.append(required)
+    insert_names = {c.name for c in column_defs}
 
     col_sql = ", ".join(f"`{c}`" for c in fields)
     src_table = f"`tab{child_doctype}`"
     written = 0
+    batch_number = 0
+    touched_parents: set[str] = set()
+    live = ctx.live or live_status.NullLiveRun()
     lower = incremental_lower_bound(ctx)
     position: tuple[datetime, Any] | None = None
 
     while True:
+        if _is_cancelled(ctx.config_name):
+            raise SyncCancelledError(f"Sync cancelled for {ctx.config_name}.")
         conditions = ["parenttype = %(ptype)s"]
         params: dict[str, Any] = {"ptype": ctx.doctype, "limit": ctx.batch_size}
         if ctx.sync_mode == "Incremental":
@@ -1021,7 +1147,7 @@ def _sync_one_child(
         if not rows:
             break
 
-        columns, data = _prepare_batch(ctx, rows, child_schema.columns, synced_at)
+        columns, data = _prepare_batch(ctx, rows, column_defs, synced_at)
         client.insert(
             table=child_schema.table_name,
             data=data,
@@ -1029,6 +1155,16 @@ def _sync_one_child(
             database=database,
         )
         written += len(data)
+        batch_number += 1
+        touched_parents.update(row.get("parent") for row in rows if row.get("parent"))
+        # Keep the dashboard heartbeat alive: a large child table can take
+        # longer than the stall threshold.
+        live.update(
+            force=True,
+            phase=f"child table {child_doctype}",
+            child_rows_written=written,
+            child_batch=batch_number,
+        )
         position = (
             (get_datetime(rows[-1]["modified"]), rows[-1]["name"])
             if ctx.sync_mode == "Incremental"
@@ -1038,18 +1174,37 @@ def _sync_one_child(
             break
 
     if ctx.delete_strategy != "Ignore":
-        _reconcile_missing_rows(
-            client,
-            child_doctype,
-            child_schema.table_name,
-            database,
-            ctx.delete_strategy,
-            source_parenttype=ctx.doctype,
-        )
+        live.update(force=True, phase=f"reconciling child table {child_doctype}")
+        if ctx.sync_mode == "Full" or ctx.reconcile_deletes_incremental or lower is None:
+            # Full comparison: full syncs, opted-in incremental syncs, and the
+            # first incremental run (no window to scope the check to).
+            _reconcile_missing_rows(
+                client,
+                child_doctype,
+                child_schema.table_name,
+                database,
+                ctx.delete_strategy,
+                source_parenttype=ctx.doctype,
+            )
+        else:
+            # Incremental: only the children of parents changed in this
+            # window (plus parents of child rows read in it) can have gone.
+            parents = set(_parents_changed_in_window(ctx, synced_at)) | touched_parents
+            if parents and "parent" in insert_names:
+                _reconcile_children_of_parents(
+                    client,
+                    child_doctype,
+                    child_schema.table_name,
+                    database,
+                    ctx.delete_strategy,
+                    ctx.doctype,
+                    sorted(parents),
+                )
 
     if written and ctx.optimize_after_sync and (
         ctx.sync_mode == "Full" or not ctx.optimize_only_on_full
     ):
+        live.update(force=True, phase=f"optimizing {child_schema.table_name}")
         _optimize_table(client, database, child_schema.table_name)
 
     return written
@@ -1111,6 +1266,7 @@ def run_sync(
     try:
         ctx = build_context(config_name, trigger=trigger, mode=mode)
     except Exception as exc:  # noqa: BLE001 - config errors are terminal
+        _safe_rollback()
         result.status = "Failed"
         result.end_time = now_datetime()
         result.exception = traceback.format_exc()
@@ -1151,6 +1307,7 @@ def run_sync(
                 )
                 live.update(force=True, last_error=str(exc)[:300])
                 if attempt >= ctx.retry_count or not transient:
+                    _safe_rollback()
                     result.status = "Failed"
                     result.exception = traceback.format_exc()
                     result.message = str(exc)
@@ -1159,6 +1316,9 @@ def run_sync(
                 # Only now is it certain another attempt follows; the phase the
                 # failure happened in stays recorded until this point.
                 live.update(force=True, phase="retrying")
+                # A transient database error (deadlock, lost connection) can
+                # leave the transaction unusable for the next attempt.
+                _safe_rollback()
                 # Reset per-attempt counters before the next attempt.
                 result.rows_read = 0
                 result.rows_written = 0
@@ -1168,6 +1328,7 @@ def run_sync(
         # Not an ordinary error: the worker is being stopped (SystemExit,
         # KeyboardInterrupt) or something escaped the handlers above. Record
         # the run as Failed so it is visible, then let the signal propagate.
+        _safe_rollback()
         result.status = "Failed"
         result.exception = traceback.format_exc()
         result.message = f"Sync interrupted: {type(exc).__name__}: {exc}"
@@ -1192,9 +1353,37 @@ def run_sync(
     return result
 
 
+MAX_BACKOFF_SECONDS = 300
+
+
+def _backoff_delay(base_interval: int, attempt: int) -> float:
+    """Exponential backoff, capped, with up to 20% jitter.
+
+    The cap keeps a long retry series from sleeping for most of an hour (and
+    stays under the dashboard's stall threshold); the jitter stops many
+    configurations that failed together from retrying in lock-step.
+    """
+    delay = min(float(base_interval) * (2 ** (attempt - 1)), MAX_BACKOFF_SECONDS)
+    return delay * (1 + random.uniform(0, 0.2))
+
+
 def _backoff_sleep(base_interval: int, attempt: int) -> None:
-    """Sleep with exponential backoff between retry attempts."""
-    time.sleep(base_interval * (2 ** (attempt - 1)))
+    """Sleep with capped exponential backoff between retry attempts."""
+    time.sleep(_backoff_delay(base_interval, attempt))
+
+
+def _safe_rollback() -> None:
+    """Roll back a possibly broken transaction before writing the Sync Log.
+
+    After a database error (lock wait timeout, lost connection) the open
+    transaction can refuse further writes, which used to lose the log of the
+    very failure it should record. Cursor positions were committed batch by
+    batch, so nothing that must be kept is rolled back.
+    """
+    try:
+        frappe.db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _write_log(config_name: str, trigger: str, result: SyncResult) -> str:
@@ -1223,46 +1412,181 @@ def _write_log(config_name: str, trigger: str, result: SyncResult) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Real-time delete propagation (called from doc_events on_trash)
+# Delete propagation (queued from doc_events after_delete, applied in batches)
 # --------------------------------------------------------------------------- #
-def propagate_delete(doctype: str, docname: str) -> None:
-    """Propagate a single Frappe deletion to ClickHouse in real time.
+# Deletes used to be sent from ``on_trash``: inside the user's request, BEFORE
+# Frappe checked links and before the transaction committed. A delete refused
+# because other documents link to it ("Cannot delete ... linked with ...")
+# had already removed the row from ClickHouse, and a ClickHouse outage made
+# every delete in the ERP hang through the connection retries. Now the
+# document name is queued in Redis only once the delete has COMMITTED, and a
+# short background job applies queued deletes as one mutation per DocType per
+# batch. Anything the queue misses (Redis restart, worker crash) is still
+# caught by delete reconciliation.
+PENDING_DELETES_KEY = "clickhouse_sync:pending_deletes"
+DELETE_STRATEGIES_KEY = "clickhouse_sync:delete_strategies"
+DELETE_STRATEGIES_TTL_SECONDS = 300
+FLUSH_DELETES_JOB_ID = "clickhouse_sync::flush_pending_deletes"
+FLUSH_MAX_ITEMS_PER_RUN = 50000
 
-    Wired to the framework ``on_trash`` event for every configured DocType.
-    Honours the configuration's delete strategy. Silently no-ops when the
-    DocType is not configured or its strategy is ``Ignore``.
+
+def _load_delete_strategies() -> dict[str, str]:
+    rows = frappe.db.sql(
+        "SELECT source_doctype, delete_strategy FROM `tabClickHouse Sync Configuration` "
+        "WHERE enabled = 1",
+        as_dict=True,
+    )
+    return {r["source_doctype"]: (r["delete_strategy"] or "Ignore") for r in rows}
+
+
+def delete_strategy_for(doctype: str) -> str | None:
+    """Delete strategy of the enabled configuration for ``doctype``, if any.
+
+    Cached in Redis because the ``after_delete`` hook runs for every delete of
+    every DocType; the cache is cleared whenever a configuration changes.
     """
-    config_name = frappe.db.get_value(
+    try:
+        cache = frappe.cache()
+        mapping = cache.get_value(DELETE_STRATEGIES_KEY)
+        if mapping is None:
+            mapping = _load_delete_strategies()
+            cache.set_value(
+                DELETE_STRATEGIES_KEY, mapping, expires_in_sec=DELETE_STRATEGIES_TTL_SECONDS
+            )
+    except Exception:  # noqa: BLE001 - Redis down: ask the database
+        mapping = _load_delete_strategies()
+    return mapping.get(doctype)
+
+
+def clear_delete_strategy_cache() -> None:
+    try:
+        frappe.cache().delete_value(DELETE_STRATEGIES_KEY)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def queue_delete(doctype: str, docname: str) -> bool:
+    """Queue ``doctype``/``docname`` for deletion in ClickHouse after commit.
+
+    Returns ``True`` if the delete will be propagated. Does no ClickHouse I/O,
+    so it adds nothing noticeable to the user's delete request.
+    """
+    strategy = delete_strategy_for(doctype)
+    if strategy not in ("Soft Delete", "Hard Delete"):
+        return False
+    payload = json.dumps([doctype, docname])
+
+    def _push() -> None:
+        try:
+            frappe.cache().rpush(PENDING_DELETES_KEY, payload)
+            frappe.enqueue(
+                "clickhouse_sync.tasks.flush_pending_deletes",
+                queue="short",
+                job_id=FLUSH_DELETES_JOB_ID,
+                deduplicate=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - reconciliation is the safety net
+            frappe.logger("clickhouse_sync").warning(
+                f"could not queue ClickHouse delete for {doctype}/{docname}: {exc}"
+            )
+
+    after_commit = getattr(frappe.db, "after_commit", None)
+    if after_commit is not None:
+        after_commit.add(_push)
+    else:  # pragma: no cover - very old Frappe without commit callbacks
+        _push()
+    return True
+
+
+def _decode(raw: Any) -> tuple[str, str] | None:
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        doctype, name = json.loads(raw)
+        return str(doctype), str(name)
+    except Exception:  # noqa: BLE001 - drop malformed entries
+        return None
+
+
+def flush_pending_deletes(max_items: int = FLUSH_MAX_ITEMS_PER_RUN) -> int:
+    """Apply queued deletes, one ClickHouse mutation per DocType per batch.
+
+    Transient failures put the batch back on the queue for the next flush;
+    permanent ones are logged and dropped (reconciliation repairs them).
+
+    Returns:
+        The number of queued entries processed.
+    """
+    cache = frappe.cache()
+    logger = frappe.logger("clickhouse_sync")
+    processed = 0
+    while processed < max_items:
+        raw_items = cache.lrange(PENDING_DELETES_KEY, 0, DELETE_RECONCILE_BATCH_SIZE - 1) or []
+        if not raw_items:
+            break
+        cache.ltrim(PENDING_DELETES_KEY, len(raw_items), -1)
+        processed += len(raw_items)
+
+        by_doctype: dict[str, list[str]] = {}
+        for raw in raw_items:
+            item = _decode(raw)
+            if item:
+                by_doctype.setdefault(item[0], []).append(item[1])
+
+        for doctype, names in by_doctype.items():
+            try:
+                propagate_delete(doctype, names)
+            except Exception as exc:  # noqa: BLE001
+                if is_transient_error(exc):
+                    for name in names:
+                        cache.rpush(PENDING_DELETES_KEY, json.dumps([doctype, name]))
+                    logger.warning(
+                        f"ClickHouse delete for {len(names)} {doctype} row(s) re-queued: {exc}"
+                    )
+                    return processed  # ClickHouse is struggling: try again later
+                logger.error(
+                    f"ClickHouse delete for {len(names)} {doctype} row(s) dropped "
+                    f"(reconciliation will retry): {exc}"
+                )
+    return processed
+
+
+def propagate_delete(doctype: str, docnames: str | list[str]) -> int:
+    """Apply a deletion of ``docnames`` to ClickHouse now, in one mutation.
+
+    Honours the configuration's delete strategy and is a no-op when the
+    DocType is not configured or its strategy is ``Ignore``. Names that exist
+    in the source again (restored documents) are skipped. Errors propagate so
+    the caller can retry; :func:`flush_pending_deletes` handles that.
+
+    Returns:
+        The number of names sent to ClickHouse.
+    """
+    names = [docnames] if isinstance(docnames, str) else list(dict.fromkeys(docnames))
+    if not names:
+        return 0
+    strategy = frappe.db.get_value(
         "ClickHouse Sync Configuration",
         {"source_doctype": doctype, "enabled": 1},
-        "name",
+        "delete_strategy",
     )
-    if not config_name:
-        return
+    if strategy not in ("Soft Delete", "Hard Delete"):
+        return 0
 
-    strategy = frappe.db.get_value(
-        "ClickHouse Sync Configuration", config_name, "delete_strategy"
+    placeholders = ", ".join(f"%(name_{i})s" for i in range(len(names)))
+    existing = frappe.db.sql(
+        f"SELECT name FROM `tab{doctype}` WHERE name IN ({placeholders})",
+        {f"name_{i}": name for i, name in enumerate(names)},
+        as_dict=True,
     )
-    if strategy == "Ignore":
-        return
+    still_there = {row["name"] for row in existing}
+    names = [name for name in names if name not in still_there]
+    if not names:
+        return 0
 
-    try:
-        client = ch_connection.get_client()
-        database = ch_connection.get_connection_params().database
-        table = table_name_for(doctype)
-        if strategy == "Soft Delete":
-            client.command(
-                f"ALTER TABLE `{database}`.`{table}` "
-                f"UPDATE `{SOFT_DELETE_COLUMN}` = 1 "
-                "WHERE `name` = {name:String}",
-                parameters={"name": docname},
-            )
-        elif strategy == "Hard Delete":
-            client.command(
-                f"DELETE FROM `{database}`.`{table}` WHERE `name` = {{name:String}}",
-                parameters={"name": docname},
-            )
-    except Exception as exc:  # noqa: BLE001 - never block the Frappe delete
-        frappe.logger("clickhouse_sync").warning(
-            f"Real-time delete propagation failed for {doctype}/{docname}: {exc}"
-        )
+    client = ch_connection.get_client()
+    database = ch_connection.get_connection_params().database
+    table = table_name_for(doctype)
+    for start in range(0, len(names), DELETE_RECONCILE_BATCH_SIZE):
+        _apply_delete(client, database, table, strategy, names[start : start + DELETE_RECONCILE_BATCH_SIZE])
+    return len(names)

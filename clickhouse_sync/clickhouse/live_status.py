@@ -139,6 +139,14 @@ def mark_queued(config_name: str, doctype: str | None, trigger: str, mode: str |
     current = _read(LIVE_PREFIX + config_name)
     if current and current.get("status") == "Running":
         return
+    # Re-queueing a job that is still waiting keeps its original queue time:
+    # a stop pressed while it waited is honoured only if it came after
+    # ``queued_at``, and a scheduler tick must not push that time forward.
+    queued_at = (
+        current.get("queued_at")
+        if current and current.get("status") == "Queued" and current.get("queued_at")
+        else _iso(now_datetime())
+    )
     _write(
         LIVE_PREFIX + config_name,
         {
@@ -148,7 +156,7 @@ def mark_queued(config_name: str, doctype: str | None, trigger: str, mode: str |
             "trigger": trigger,
             "mode": mode,
             "job_id": job_id,
-            "queued_at": _iso(now_datetime()),
+            "queued_at": queued_at,
         },
         LIVE_TTL_SECONDS,
     )

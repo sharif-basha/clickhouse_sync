@@ -51,8 +51,9 @@ class SyncCancelledError(ClickHouseSyncError):
 # Classification order (first match wins):
 #
 #   1. Our own permanent error types, and background-job timeouts -> permanent.
-#   2. ClickHouseConnectionError                                  -> transient.
-#   3. A ClickHouse server error code in the message              -> by code.
+#   2. A ClickHouse server error code in the message              -> by code.
+#   3. ClickHouseConnectionError                                  -> transient.
+#      MariaDB DB-API errors                                      -> by errno.
 #   4. Python programming/data errors (ValueError, TypeError ...) -> permanent.
 #   5. Network exception classes (builtin and driver/http ones)   -> transient.
 #   6. Unambiguous network phrases in the message                 -> transient.
@@ -119,6 +120,25 @@ _TRANSIENT_EXCEPTION_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# MariaDB / MySQL client error numbers worth retrying. PyMySQL raises
+# ``OperationalError`` for *every* server error number >= 1000 that it has no
+# specific mapping for - including "Unknown column" (1054) and "Access denied"
+# (1045) - so the class name alone must not make an error transient.
+TRANSIENT_MARIADB_ERRNOS: frozenset[int] = frozenset(
+    {
+        1040,  # ER_CON_COUNT_ERROR (too many connections)
+        1053,  # ER_SERVER_SHUTDOWN
+        1205,  # ER_LOCK_WAIT_TIMEOUT
+        1213,  # ER_LOCK_DEADLOCK
+        1927,  # ER_CONNECTION_KILLED
+        2002,  # CR_CONNECTION_ERROR
+        2003,  # CR_CONN_HOST_ERROR
+        2006,  # CR_SERVER_GONE_ERROR
+        2013,  # CR_SERVER_LOST
+        2055,  # CR_SERVER_LOST_EXTENDED
+    }
+)
+
 # Phrases that only appear in network failures. Kept as a last resort for
 # exceptions that arrive as plain ``Exception``/``OSError`` with no error code.
 TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
@@ -163,6 +183,22 @@ def clickhouse_error_code(exc: BaseException) -> int | None:
     return None
 
 
+def _mariadb_errno(exc: BaseException) -> int | None:
+    """Return the MySQL/MariaDB error number of a DB-API error, if it has one.
+
+    PyMySQL errors carry ``(errno, message)`` in ``args``. Only exceptions that
+    look like DB-API errors (by class name) are inspected, so an arbitrary
+    exception whose first argument is an int is not misread.
+    """
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    if not names & {"OperationalError", "InterfaceError", "InternalError", "ProgrammingError", "DatabaseError"}:
+        return None
+    args = getattr(exc, "args", ())
+    if args and isinstance(args[0], int) and not isinstance(args[0], bool):
+        return args[0]
+    return None
+
+
 def is_job_timeout(exc: BaseException) -> bool:
     """Return ``True`` if ``exc`` is the background worker's job time limit.
 
@@ -194,14 +230,21 @@ def is_transient_error(exc: BaseException) -> bool:
     if is_job_timeout(exc):
         return False
 
-    # 2. Explicitly transient.
-    if isinstance(exc, ClickHouseConnectionError):
-        return True
-
-    # 3. The server told us exactly what went wrong.
+    # 2. The server told us exactly what went wrong. Checked before the
+    #    connection-error type, because a failed connect can still carry a
+    #    permanent server code (wrong password, unknown database).
     code = clickhouse_error_code(exc)
     if code is not None:
         return code in TRANSIENT_CLICKHOUSE_CODES
+
+    # 3. Explicitly transient.
+    if isinstance(exc, ClickHouseConnectionError):
+        return True
+
+    # 3b. MariaDB errors: decided by error number, not by class name.
+    errno = _mariadb_errno(exc)
+    if errno is not None:
+        return errno in TRANSIENT_MARIADB_ERRNOS
 
     # 4. Bugs and bad data never fix themselves.
     if isinstance(exc, _PERMANENT_EXCEPTION_TYPES):
@@ -237,6 +280,10 @@ ERROR_CATEGORIES: tuple[str, ...] = (
     "Unexpected",
 )
 
+# Codes that mean the settings are wrong: unknown user, wrong password,
+# authentication failure. Retrying cannot fix them.
+CONFIGURATION_CLICKHOUSE_CODES: frozenset[int] = frozenset({192, 193, 194, 195, 516})
+
 _CAPACITY_CODES = frozenset({202, 203, 241, 242, 252})
 _TIMEOUT_CODES = frozenset({159, 209})
 _CONNECTION_CODES = frozenset({198, 210, 225, 279, 999})
@@ -253,7 +300,7 @@ def _category_for_code(code: int) -> str:
         return "Schema"
     if code in (6, 27, 38, 41, 69, 70, 72):  # value parse/convert errors
         return "Data"
-    if code in (192, 193, 194, 195, 516):  # unknown user / wrong password / auth
+    if code in CONFIGURATION_CLICKHOUSE_CODES:  # unknown user / wrong password / auth
         return "Configuration"
     return "ClickHouse error"
 
@@ -268,11 +315,11 @@ def categorize_error(exc: BaseException) -> str:
         return "Configuration"
     if isinstance(exc, ClickHouseSchemaError):
         return "Schema"
-    if isinstance(exc, ClickHouseConnectionError):
-        return "Connection"
     code = clickhouse_error_code(exc)
     if code is not None:
         return _category_for_code(code)
+    if isinstance(exc, ClickHouseConnectionError):
+        return "Connection"
     if isinstance(exc, TimeoutError):
         return "Timeout"
     if isinstance(exc, _PERMANENT_EXCEPTION_TYPES):

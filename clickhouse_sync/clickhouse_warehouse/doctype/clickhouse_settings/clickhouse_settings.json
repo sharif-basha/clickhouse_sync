@@ -23,6 +23,7 @@
   "default_engine",
   "alerts_section",
   "staleness_alert_hours",
+  "log_retention_days",
   "actions_section",
   "connection_status",
   "telegram_section",
@@ -124,11 +125,12 @@
    "label": "Max Insert Block Size"
   },
   {
-   "default": "MergeTree",
-   "description": "Default table engine used when auto-creating tables.",
+   "default": "ReplacingMergeTree",
+   "description": "Informational. Tables are always created as ReplacingMergeTree keyed on name.",
    "fieldname": "default_engine",
    "fieldtype": "Data",
-   "label": "Default Engine"
+   "label": "Default Engine",
+   "read_only": 1
   },
   {
    "fieldname": "alerts_section",
@@ -141,6 +143,14 @@
    "fieldname": "staleness_alert_hours",
    "fieldtype": "Int",
    "label": "Staleness Alert Hours"
+  },
+  {
+   "fieldname": "log_retention_days",
+   "fieldtype": "Int",
+   "label": "Log Retention Days",
+   "default": "90",
+   "non_negative": 1,
+   "description": "Sync Logs older than this many days are deleted daily. 0 keeps every log."
   },
   {
    "fieldname": "actions_section",
@@ -192,7 +202,7 @@
  "index_web_pages_for_search": 0,
  "issingle": 1,
  "links": [],
- "modified": "2026-01-01 00:00:00.000000",
+ "modified": "2026-11-26 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "ClickHouse Warehouse",
  "name": "ClickHouse Settings",
@@ -204,14 +214,6 @@
    "print": 1,
    "read": 1,
    "role": "System Manager",
-   "share": 1,
-   "write": 1
-  },
-  {
-   "create": 1,
-   "print": 1,
-   "read": 1,
-   "role": "ClickHouse Sync Manager",
    "share": 1,
    "write": 1
   }

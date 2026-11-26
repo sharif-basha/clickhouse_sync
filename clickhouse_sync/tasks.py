@@ -15,16 +15,75 @@ import frappe
 from frappe.utils import add_to_date, cint, get_datetime, now_datetime
 
 from clickhouse_sync.clickhouse import live_status, sync_engine
-from clickhouse_sync.clickhouse.sync_engine import propagate_delete  # re-exported
+from clickhouse_sync.clickhouse.sync_engine import propagate_delete  # noqa: F401 - re-exported
 
 __all__ = [
+    "enqueue_config_sync",
     "run_configuration_sync",
     "run_scheduled_syncs",
     "run_hourly_syncs",
     "run_daily_syncs",
     "check_sync_staleness",
     "propagate_doc_delete",
+    "flush_pending_deletes",
+    "purge_old_sync_logs",
 ]
+
+JOB_TIMEOUT_SECONDS = 21600  # 6 hours - large full syncs
+VALID_TRIGGERS = ("Manual", "Scheduler")
+DEFAULT_LOG_RETENTION_DAYS = 90
+
+
+def job_id_for(config_name: str) -> str:
+    return f"clickhouse_sync::{config_name}"
+
+
+def _job_is_active(job_id: str) -> bool | None:
+    """``True``/``False`` if the queue knows the job, ``None`` if unknown."""
+    try:
+        from frappe.utils.background_jobs import is_job_enqueued
+
+        return bool(is_job_enqueued(job_id))
+    except Exception:  # noqa: BLE001 - older Frappe or Redis queue unreachable
+        return None
+
+
+def enqueue_config_sync(
+    config_name: str,
+    trigger: str = "Manual",
+    mode: str | None = None,
+    doctype: str | None = None,
+    job_active=None,  # noqa: ANN001 - injectable for tests
+) -> dict:
+    """Queue one configuration's sync job; the single place that does so.
+
+    A job for the configuration that is already queued or running is left
+    alone and reported as not queued. Previously the queue silently dropped
+    the duplicate while the dashboard's live record was overwritten - a
+    "Full" request then showed as queued while the earlier Incremental job
+    ran, and the API answered ``queued: true``.
+
+    Returns:
+        ``{"queued": bool, "job_id": str, "reason": str | None}``
+    """
+    if trigger not in VALID_TRIGGERS:
+        trigger = "Manual"
+    job_id = job_id_for(config_name)
+    active = (job_active or _job_is_active)(job_id)
+    if active:
+        return {"queued": False, "job_id": job_id, "reason": "already queued or running"}
+    frappe.enqueue(
+        "clickhouse_sync.tasks.run_configuration_sync",
+        queue="long",
+        timeout=JOB_TIMEOUT_SECONDS,
+        job_id=job_id,
+        deduplicate=True,
+        config_name=config_name,
+        trigger=trigger,
+        mode=mode,
+    )
+    live_status.mark_queued(config_name, doctype, trigger, mode, job_id)
+    return {"queued": True, "job_id": job_id, "reason": None}
 
 
 def run_configuration_sync(
@@ -70,18 +129,8 @@ def _enqueue_enabled_configs(trigger: str = "Scheduler") -> list[str]:
 
     enqueued: list[str] = []
     for config in configs:
-        job_id = f"clickhouse_sync::{config.name}"
-        frappe.enqueue(
-            "clickhouse_sync.tasks.run_configuration_sync",
-            queue="long",
-            timeout=21600,
-            job_id=job_id,
-            deduplicate=True,
-            config_name=config.name,
-            trigger=trigger,
-        )
-        live_status.mark_queued(config.name, None, trigger, None, job_id)
-        enqueued.append(config.name)
+        if enqueue_config_sync(config.name, trigger=trigger)["queued"]:
+            enqueued.append(config.name)
 
     if enqueued:
         frappe.logger("clickhouse_sync").info(
@@ -96,12 +145,12 @@ def run_scheduled_syncs() -> list[str]:
 
 
 def run_hourly_syncs() -> list[str]:
-    """Hourly scheduler entry point."""
+    """Kept for compatibility; no longer scheduled (the 15-minute cron covers it)."""
     return _enqueue_enabled_configs(trigger="Scheduler")
 
 
 def run_daily_syncs() -> list[str]:
-    """Daily scheduler entry point."""
+    """Kept for compatibility; no longer scheduled (the 15-minute cron covers it)."""
     return _enqueue_enabled_configs(trigger="Scheduler")
 
 
@@ -177,18 +226,44 @@ def _raise_staleness_alert(stale: list[str], threshold: int) -> None:
 
 
 def propagate_doc_delete(doc, method: str | None = None) -> None:  # noqa: ANN001
-    """``on_trash`` doc-event handler: propagate a deletion to ClickHouse.
+    """``after_delete`` doc-event handler: queue a deletion for ClickHouse.
 
-    Registered against ``*`` in ``hooks.py``; it filters to configured
-    DocTypes inside :func:`propagate_delete`, so the overhead for
-    non-configured DocTypes is a single cached lookup.
+    Registered against ``*`` in ``hooks.py``. ``after_delete`` runs once
+    Frappe's link checks have passed, and the name is only queued when the
+    transaction commits, so a refused or rolled-back delete never reaches
+    ClickHouse. No ClickHouse call happens inside the user's request; for
+    non-configured DocTypes the cost is one cached lookup.
     """
     try:
-        propagate_delete(doc.doctype, doc.name)
+        sync_engine.queue_delete(doc.doctype, doc.name)
     except Exception as exc:  # noqa: BLE001 - never block a Frappe delete
         frappe.logger("clickhouse_sync").warning(
-            f"on_trash propagation error for {doc.doctype}/{doc.name}: {exc}"
+            f"delete propagation error for {doc.doctype}/{doc.name}: {exc}"
         )
+
+
+def flush_pending_deletes() -> int:
+    """Background job / cron target: apply queued deletes in batches."""
+    return sync_engine.flush_pending_deletes()
+
+
+def purge_old_sync_logs() -> int:
+    """Daily: delete Sync Logs older than ``Log Retention Days`` (0 keeps all).
+
+    Without this the log table grew by ~96 rows per configuration per day
+    and every dashboard refresh aggregated all of it.
+    """
+    raw = frappe.db.get_single_value("ClickHouse Settings", "log_retention_days")
+    days = DEFAULT_LOG_RETENTION_DAYS if raw is None else cint(raw)
+    if days <= 0:
+        return 0
+    cutoff = add_to_date(now_datetime(), days=-days)
+    count = frappe.db.count("ClickHouse Sync Log", {"creation": ("<", cutoff)})
+    if count:
+        frappe.db.delete("ClickHouse Sync Log", {"creation": ("<", cutoff)})
+        frappe.db.commit()
+        frappe.logger("clickhouse_sync").info(f"Purged {count} Sync Log(s) older than {days} days")
+    return count
 
 
 def send_batch_digest() -> None:
@@ -200,7 +275,7 @@ def send_batch_digest() -> None:
     """
     from clickhouse_sync.clickhouse.alerts import send_batch_digest as _digest
 
-    _digest(window_minutes=20)
+    _digest()
 
 
 def send_daily_heartbeat() -> None:

@@ -107,20 +107,12 @@ def _window(days: Any) -> int:
     return max(1, min(cint(days) or 7, MAX_WINDOW_DAYS))
 
 
-def _enqueue(config_name: str, doctype: str | None, mode: str | None, trigger: str = "Manual") -> str:
-    job_id = _job_id(config_name)
-    frappe.enqueue(
-        "clickhouse_sync.tasks.run_configuration_sync",
-        queue="long",
-        timeout=JOB_TIMEOUT_SECONDS,
-        job_id=job_id,
-        deduplicate=True,
-        config_name=config_name,
-        trigger=trigger,
-        mode=mode,
+def _enqueue(config_name: str, doctype: str | None, mode: str | None, trigger: str = "Manual") -> dict[str, Any]:
+    from clickhouse_sync.tasks import enqueue_config_sync
+
+    return enqueue_config_sync(
+        config_name, trigger=trigger, mode=mode, doctype=doctype, job_active=_job_active
     )
-    live_status.mark_queued(config_name, doctype, trigger, mode, job_id)
-    return job_id
 
 
 def _validate_mode(mode: str | None) -> str | None:
@@ -653,8 +645,18 @@ def start_sync(configuration: str, mode: str | None = None) -> dict[str, Any]:
     if not config["enabled"]:
         frappe.throw(_("Configuration {0} is disabled.").format(configuration))
     run_mode = _validate_mode(mode)
-    job_id = _enqueue(configuration, config["source_doctype"], run_mode)
-    return {"queued": [configuration], "job_id": job_id, "mode": run_mode}
+    outcome = _enqueue(configuration, config["source_doctype"], run_mode)
+    if not outcome["queued"]:
+        # Tell the user instead of pretending: the job already waiting or
+        # running keeps its own mode.
+        return {
+            "queued": [],
+            "skipped": [configuration],
+            "job_id": outcome["job_id"],
+            "mode": run_mode,
+            "message": _("A sync for {0} is already queued or running.").format(configuration),
+        }
+    return {"queued": [configuration], "job_id": outcome["job_id"], "mode": run_mode}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -662,12 +664,14 @@ def start_all(mode: str | None = None) -> dict[str, Any]:
     """Queue every enabled configuration, in priority order."""
     _guard()
     run_mode = _validate_mode(mode)
-    queued = []
+    queued, skipped = [], []
     for config in _configs():
         if config["enabled"]:
-            _enqueue(config["name"], config["source_doctype"], run_mode)
-            queued.append(config["name"])
-    return {"queued": queued, "mode": run_mode}
+            if _enqueue(config["name"], config["source_doctype"], run_mode)["queued"]:
+                queued.append(config["name"])
+            else:
+                skipped.append(config["name"])
+    return {"queued": queued, "skipped": skipped, "mode": run_mode}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -675,12 +679,14 @@ def retry_failed() -> dict[str, Any]:
     """Queue every enabled configuration whose latest finished run failed."""
     _guard()
     history = _per_config_history()
-    queued = []
+    queued, skipped = [], []
     for config in _configs():
         if config["enabled"] and history.get(config["name"], {}).get("last_status") == "Failed":
-            _enqueue(config["name"], config["source_doctype"], None)
-            queued.append(config["name"])
-    return {"queued": queued}
+            if _enqueue(config["name"], config["source_doctype"], None)["queued"]:
+                queued.append(config["name"])
+            else:
+                skipped.append(config["name"])
+    return {"queued": queued, "skipped": skipped}
 
 
 @frappe.whitelist(methods=["POST"])

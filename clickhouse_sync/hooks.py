@@ -34,27 +34,27 @@ app_include_css = ["/assets/clickhouse_sync/css/clickhouse_sync.css"]
 # --------------------------------------------------------------------------- #
 # Propagate deletions in real time for every DocType; the handler filters to
 # configured DocTypes internally, so the cost for others is a single lookup.
+# ``after_delete`` (not ``on_trash``): it runs after Frappe's link checks, so a
+# delete Frappe refuses never reaches ClickHouse; the handler only queues the
+# name, after commit, and a background job applies it.
 doc_events = {
     "*": {
-        "on_trash": "clickhouse_sync.tasks.propagate_doc_delete",
+        "after_delete": "clickhouse_sync.tasks.propagate_doc_delete",
     }
 }
 
 # --------------------------------------------------------------------------- #
 # Scheduler
 # --------------------------------------------------------------------------- #
+# The 15-minute cron already queues every scheduler-enabled configuration;
+# the former hourly_long / daily_long entries only re-queued the same jobs.
 scheduler_events = {
-    "hourly_long": [
-        "clickhouse_sync.tasks.run_hourly_syncs",
-    ],
     "hourly": [
         "clickhouse_sync.tasks.check_sync_staleness",
     ],
-    "daily_long": [
-        "clickhouse_sync.tasks.run_daily_syncs",
-    ],
     "daily": [
         "clickhouse_sync.tasks.send_daily_heartbeat",
+        "clickhouse_sync.tasks.purge_old_sync_logs",
     ],
     "cron": {
         # Every 15 minutes: catch incremental configurations promptly.
@@ -65,6 +65,11 @@ scheduler_events = {
         # (only if that batch had failures; healthy batches stay silent).
         "5,20,35,50 * * * *": [
             "clickhouse_sync.tasks.send_batch_digest",
+        ],
+        # Safety net for queued deletes whose flush job was de-duplicated
+        # away while another flush was running.
+        "*/5 * * * *": [
+            "clickhouse_sync.tasks.flush_pending_deletes",
         ],
     },
 }
