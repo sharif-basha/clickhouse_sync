@@ -9,6 +9,7 @@ M = medium) and runs the engine's real code against the in-memory fakes.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sys
 import types
 import unittest
@@ -113,6 +114,27 @@ class TestC1DeletePropagation(unittest.TestCase):
         self.assertIn("A", self.h.warehouse())
         sync_engine.flush_pending_deletes()
         self.assertNotIn("A", self.h.warehouse())
+
+    def test_transient_failure_requeues_every_untried_doctype(self) -> None:
+        # Review finding: only the failing group went back on the queue.
+        cache = self.h.frappe.cache()
+        for doctype, name in (("Alpha", "A1"), ("Beta", "B1"), ("Beta", "B2"), ("Gamma", "G1")):
+            cache.rpush(sync_engine.PENDING_DELETES_KEY, json.dumps([doctype, name]))
+        tried = []
+
+        def fail_on_beta(doctype, names):
+            tried.append(doctype)
+            if doctype == "Beta":
+                raise ConnectionResetError("connection reset")
+            return len(names)
+
+        with mock.patch.object(sync_engine, "propagate_delete", fail_on_beta):
+            sync_engine.flush_pending_deletes()
+        self.assertEqual(tried, ["Alpha", "Beta"])
+        left = sorted(
+            tuple(json.loads(raw)) for raw in cache.lrange(sync_engine.PENDING_DELETES_KEY, 0, -1)
+        )
+        self.assertEqual(left, [("Beta", "B1"), ("Beta", "B2"), ("Gamma", "G1")])
 
     def test_unconfigured_doctype_costs_no_queue_entry(self) -> None:
         self.assertFalse(sync_engine.queue_delete("Some Other DocType", "X"))
@@ -262,6 +284,16 @@ class TestSchemaFixes(unittest.TestCase):
         self.assertEqual(self.h.run().status, "Completed")
         self.assertNotIn("title", self.h.warehouse()["DOC-00"])
 
+    def test_integer_values_survive_an_unmigrated_uint8_column(self) -> None:
+        # Review finding: a Check field turned Int over a UInt8 column had
+        # its values collapsed to 0/1.
+        self.h.set_config(auto_update_schema=0)
+        self.h.frappe.metas[self.h.DOCTYPE] = FakeMeta([docfield("title", "Int")])
+        self._existing_table(title="Nullable(UInt8)")
+        self.h.db.conn.execute("UPDATE `tabDoc` SET title = 2")
+        self.assertEqual(self.h.run().status, "Completed")
+        self.assertEqual(self.h.warehouse()["DOC-00"]["title"], 2)
+
     def test_null_in_an_old_non_nullable_column_uses_its_empty_value(self) -> None:
         self._existing_table(title="String")  # created by an older version for a reqd field
         self.h.db.conn.execute("UPDATE `tabDoc` SET title = NULL")
@@ -356,10 +388,33 @@ class TestAlertFixes(unittest.TestCase):
             mock.patch.object(self.h.frappe, "get_all", get_all),
             mock.patch.object(alerts, "_alert_mode", lambda: "Consolidated"),
             mock.patch.object(alerts, "_resolve_credentials", lambda: (TOKEN, "chat")),
-            mock.patch.object(alerts, "_post", lambda token, chat, msg: self.sent.append(msg)),
+            mock.patch.object(alerts, "_post", self._fake_post),
         ):
             patch.start()
             self.addCleanup(patch.stop)
+
+    post_error: Exception | None = None
+
+    def _fake_post(self, token, chat, msg) -> bool:
+        if self.post_error is not None:
+            raise self.post_error
+        self.sent.append(msg)
+        return True
+
+    def test_failed_delivery_is_retried_by_the_next_digest(self) -> None:
+        # Review finding: the window moved on before Telegram had the message.
+        self._digest_setup([
+            {"configuration": "Doc", "status": "Failed", "rows_written": 0, "rows_failed": 2,
+             "creation": self.h.clock.now + dt.timedelta(minutes=1)},
+        ])
+        self.h.clock.advance(5 * 60)
+        self.post_error = alerts.TelegramError("Telegram request failed: timeout")
+        alerts.send_batch_digest()
+        self.assertEqual(self.sent, [])
+        self.post_error = None
+        self.h.clock.advance(15 * 60)
+        alerts.send_batch_digest()
+        self.assertEqual(len(self.sent), 1)
 
     def test_m9_a_failure_is_reported_once(self) -> None:
         start = self.h.clock.now

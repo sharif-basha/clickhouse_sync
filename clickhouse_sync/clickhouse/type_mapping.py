@@ -322,8 +322,11 @@ def fieldtype_for_clickhouse_type(clickhouse_type: str) -> str:
     base, _nullable = _strip_wrappers(clickhouse_type)
     if base.startswith("Decimal"):
         return "Currency"
-    if base == "UInt8":
-        return "Check"
+    # Every integer column, UInt8 included, keeps integer values as they are.
+    # Treating UInt8 as a Check collapsed values such as 2 to 0 when a Check
+    # field had become an Int field over an unmigrated column. (A column
+    # that matches its field keeps the field's own coercion; this is only
+    # used on a mismatch.)
     if re.match(r"^U?Int\d+$", base):
         return "Int"
     if base.startswith("Float"):

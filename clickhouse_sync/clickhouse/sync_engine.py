@@ -1576,15 +1576,22 @@ def flush_pending_deletes(max_items: int = FLUSH_MAX_ITEMS_PER_RUN) -> int:
             if item:
                 by_doctype.setdefault(item[0], []).append(item[1])
 
-        for doctype, names in by_doctype.items():
+        groups = list(by_doctype.items())
+        for index, (doctype, names) in enumerate(groups):
             try:
                 propagate_delete(doctype, names)
             except Exception as exc:  # noqa: BLE001
                 if is_transient_error(exc):
-                    for name in names:
-                        cache.rpush(PENDING_DELETES_KEY, json.dumps([doctype, name]))
+                    # Put back this group AND every group of the chunk not
+                    # tried yet: the whole chunk already left the queue.
+                    pending = groups[index:]
+                    for pending_doctype, pending_names in pending:
+                        for name in pending_names:
+                            cache.rpush(PENDING_DELETES_KEY, json.dumps([pending_doctype, name]))
                     logger.warning(
-                        f"ClickHouse delete for {len(names)} {doctype} row(s) re-queued: {exc}"
+                        f"ClickHouse delete re-queued for "
+                        f"{sum(len(n) for _, n in pending)} row(s) of "
+                        f"{len(pending)} DocType(s): {exc}"
                     )
                     return processed  # ClickHouse is struggling: try again later
                 logger.error(

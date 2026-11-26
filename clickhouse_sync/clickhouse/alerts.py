@@ -147,8 +147,11 @@ def _truncate(message: str) -> str:
     return message[: _MAX_MESSAGE_CHARS - 20].rsplit("\n", 1)[0] + "\n… (truncated)"
 
 
-def _post(token: str, chat_id: str, message: str) -> None:
-    """Send one message. Raises :class:`TelegramError` with the token removed."""
+def _post(token: str, chat_id: str, message: str) -> bool:
+    """Send one message; ``True`` once Telegram accepted it.
+
+    Raises :class:`TelegramError` (token removed) when the request fails.
+    """
     import requests
 
     try:
@@ -165,6 +168,8 @@ def _post(token: str, chat_id: str, message: str) -> None:
         frappe.logger("clickhouse_sync").warning(
             f"Telegram returned {resp.status_code}: {_redact(resp.text[:200], token)}"
         )
+        return False
+    return True
 
 
 @frappe.whitelist()
@@ -209,7 +214,9 @@ def _digest_cutoff(window_minutes: int | None) -> "object":
         return frappe.utils.add_to_date(now, minutes=-abs(window_minutes))
     floor = frappe.utils.add_to_date(now, minutes=-_MAX_DIGEST_WINDOW_MINUTES)
     try:
-        last = frappe.cache().get_value(LAST_DIGEST_KEY)
+        from clickhouse_sync.clickhouse.live_status import read_fresh
+
+        last = read_fresh(LAST_DIGEST_KEY)  # not the per-job cache copy
         if last:
             last = frappe.utils.get_datetime(last)
             if last > floor:
@@ -251,8 +258,8 @@ def send_batch_digest(window_minutes: int | None = None) -> "dict | None":
             fields=["configuration", "status", "rows_written", "rows_failed"],
             order_by="creation asc",
         )
-        _remember_digest(now)
         if not logs:
+            _remember_digest(now)  # nothing to report up to now
             return None
 
         # Deduplicate to the latest row per configuration in the window.
@@ -264,10 +271,23 @@ def send_batch_digest(window_minutes: int | None = None) -> "dict | None":
         failures = [r for r in runs if r["status"] not in _NOT_FAILURES]
         if not failures:
             # Healthy cycle - stay silent by design.
+            _remember_digest(now)
             return {"sent": False, "reason": "no failures", "runs": len(runs)}
 
         token, chat_id = creds
-        _post(token, chat_id, _format_batch_message(runs, failures))
+        # Move the window on only once Telegram has the message: a failed
+        # send must leave these failures in the next digest's window.
+        try:
+            delivered = _post(token, chat_id, _format_batch_message(runs, failures))
+        except Exception:
+            delivered = False
+            raise
+        finally:
+            # Delivered: the next window starts now. Not delivered: it starts
+            # where this one did, so these failures are reported next time.
+            _remember_digest(now if delivered else cutoff)
+        if not delivered:
+            return {"sent": False, "reason": "telegram rejected the message"}
         return {"sent": True, "runs": len(runs), "failures": len(failures)}
     except Exception as exc:  # noqa: BLE001
         frappe.logger("clickhouse_sync").warning(f"batch digest failed: {_redact(str(exc))}")
