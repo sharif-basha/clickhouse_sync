@@ -6,17 +6,21 @@ ClickHouse equivalent (rich text, HTML, JSON, geo, ...) it is stored as
 ``String`` so that no information is lost, and downstream reporting can parse
 it as needed.
 
-Nullability: optional fields are wrapped in ``Nullable(...)`` so that empty
-Frappe values round-trip as SQL ``NULL`` rather than as type-specific zero
-values. Fields that participate in the ``ORDER BY`` / ``PARTITION BY`` keys
-(``name`` and ``modified``) are always emitted as non-nullable because
-ClickHouse forbids nullable primary-key / partition-key columns in the general
-case and it keeps the MergeTree layout efficient.
+Nullability: every docfield column is ``Nullable(...)`` so that empty Frappe
+values round-trip as SQL ``NULL`` rather than as type-specific zero values.
+That includes mandatory fields: ``reqd`` is a form rule, not a database
+constraint, and older rows (or rows written before a field became mandatory)
+regularly hold NULL - a non-nullable column made such a batch fail. Only the
+storage-key columns (``name`` and ``modified``) are non-nullable, because
+ClickHouse forbids nullable sorting-key columns in the general case.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
+import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 # --------------------------------------------------------------------------- #
@@ -53,7 +57,9 @@ FRAPPE_TO_CLICKHOUSE: dict[str, str] = {
     "Int": "Int64",
     "Long Int": "Int64",
     "Check": "UInt8",
-    "Currency": "Decimal(21, 6)",
+    # Frappe stores Currency as decimal(21, 9); keep the same scale so no
+    # digits are lost (see CURRENCY_SCALE / build_column_definition).
+    "Currency": "Decimal(21, 9)",
     "Float": "Float64",
     "Percent": "Float64",
     "Rating": "Float32",
@@ -78,13 +84,13 @@ NON_STORED_FIELDTYPES: frozenset[str] = frozenset(
         "Fold",
         "Heading",
         "Button",
-        "HTML",  # display-only HTML block (see note below)
+        "HTML",  # display-only HTML block - Frappe never stores it
+        "Image",  # displays another field's attachment; no column of its own
+        # Child-table fields live in their own tables, not as a column here.
+        "Table",
+        "Table MultiSelect",
     }
 )
-
-# NB: "HTML" is ambiguous in Frappe - as a *field* it can hold stored markup,
-# but the layout element "HTML" is display-only. We treat an HTML field as
-# stored ONLY when it carries a fieldname; the schema builder enforces that.
 
 # Columns that are always present on every synced table and always take part
 # in the storage key. Order matters for ORDER BY.
@@ -104,7 +110,7 @@ class ColumnDefinition:
 
     @property
     def ddl(self) -> str:
-        """Return the ``\`col\` Type`` fragment for a CREATE/ALTER statement."""
+        """Return the ```col` Type`` fragment for a CREATE/ALTER statement."""
         rendered = self.clickhouse_type
         if self.nullable and not rendered.startswith("Nullable("):
             rendered = f"Nullable({rendered})"
@@ -139,20 +145,20 @@ def is_stored_field(df: Any) -> bool:
 def _is_nullable(df: Any) -> bool:
     """Decide whether a field's column should be ``Nullable``.
 
-    Mandatory fields are non-nullable; everything else is nullable so that
-    unset optional values round-trip as SQL NULL.
+    Only the storage-key columns are non-nullable. Mandatory (``reqd``) fields
+    are nullable too: the flag is enforced by forms, not by MariaDB, so source
+    rows can and do hold NULL in them.
     """
-    if getattr(df, "fieldname", None) in KEY_COLUMNS:
-        return False
-    return not int(getattr(df, "reqd", 0) or 0)
+    return getattr(df, "fieldname", None) not in KEY_COLUMNS
 
 
 def build_column_definition(df: Any) -> ColumnDefinition:
     """Build a :class:`ColumnDefinition` from a Frappe docfield.
 
     For ``Currency`` fields the docfield's configured precision (if any) is
-    used to build a ``Decimal(21, precision)`` type so monetary values keep
-    their intended scale in ClickHouse rather than a fixed default.
+    used as the Decimal scale, and the precision is widened so the column
+    always keeps at least :data:`CURRENCY_INTEGER_DIGITS` digits before the
+    decimal point (``Decimal(21, 18)`` would otherwise overflow at 1,000).
     """
     fieldname = df.fieldname
     fieldtype = df.fieldtype
@@ -161,7 +167,7 @@ def build_column_definition(df: Any) -> ColumnDefinition:
     if fieldtype == "Currency":
         precision = _docfield_precision(df)
         if precision is not None:
-            clickhouse_type = f"Decimal(21, {precision})"
+            clickhouse_type = currency_type(precision)
 
     return ColumnDefinition(
         name=fieldname,
@@ -184,10 +190,18 @@ def _docfield_precision(df: Any) -> int | None:
         precision = int(raw)
     except (TypeError, ValueError):
         return None
-    # Decimal(21, s) requires 0 <= s <= 21; clamp defensively.
     if 0 <= precision <= 18:
         return precision
     return None
+
+
+# Digits Frappe keeps before the decimal point in a decimal(21, 9) column.
+CURRENCY_INTEGER_DIGITS = 12
+
+
+def currency_type(scale: int) -> str:
+    """ClickHouse Decimal type for a Currency field with ``scale`` decimals."""
+    return f"Decimal({max(21, CURRENCY_INTEGER_DIGITS + scale)}, {scale})"
 
 
 # --------------------------------------------------------------------------- #
@@ -215,6 +229,21 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _coerce_decimal(value: Any) -> Decimal | None:
+    """Keep money exact: MariaDB returns ``Decimal``; never go through float."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool):
+        return Decimal(int(value))
+    try:
+        # str() first: Decimal(0.1) would carry the binary float error.
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
 def _coerce_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -238,7 +267,7 @@ _COERCERS: dict[str, Callable[[Any], Any]] = {
     "Check": _coerce_check,
     "Int": _coerce_int,
     "Long Int": _coerce_int,
-    "Currency": _coerce_float,
+    "Currency": _coerce_decimal,
     "Float": _coerce_float,
     "Percent": _coerce_float,
     "Rating": _coerce_float,
@@ -260,3 +289,140 @@ def coerce_value(fieldtype: str, value: Any) -> Any:
     """
     coercer = _COERCERS.get(fieldtype, _coerce_str)
     return coercer(value)
+
+
+# --------------------------------------------------------------------------- #
+# Live-column awareness
+# --------------------------------------------------------------------------- #
+# When a field's type changes in Frappe in a way the schema layer cannot
+# migrate (e.g. Data -> Int on an existing String column), the live column
+# keeps its old type. Values must then be converted for the column that
+# actually exists, or every insert would fail. These helpers derive the
+# conversion and the "empty" value from a live ClickHouse type string.
+_LOW_CARDINALITY_RE = re.compile(r"^LowCardinality\((.*)\)$")
+
+
+def _strip_wrappers(clickhouse_type: str) -> tuple[str, bool]:
+    """Return ``(base_type, nullable)`` for a live ClickHouse type string."""
+    t = clickhouse_type.strip()
+    nullable = False
+    changed = True
+    while changed:
+        changed = False
+        match = _LOW_CARDINALITY_RE.match(t)
+        if match:
+            t, changed = match.group(1).strip(), True
+        if t.startswith("Nullable(") and t.endswith(")"):
+            t, nullable, changed = t[len("Nullable("):-1].strip(), True, True
+    return t, nullable
+
+
+def fieldtype_for_clickhouse_type(clickhouse_type: str) -> str:
+    """Return the Frappe field type whose coercion suits a live column type."""
+    base, _nullable = _strip_wrappers(clickhouse_type)
+    if base.startswith("Decimal"):
+        return "Currency"
+    # Every integer column, UInt8 included, keeps integer values as they are.
+    # Treating UInt8 as a Check collapsed values such as 2 to 0 when a Check
+    # field had become an Int field over an unmigrated column. (A column
+    # that matches its field keeps the field's own coercion; this is only
+    # used on a mismatch.)
+    if re.match(r"^U?Int\d+$", base):
+        return "Int"
+    if base.startswith("Float"):
+        return "Float"
+    if base.startswith("DateTime"):
+        return "Datetime"
+    if base.startswith("Date"):
+        return "Date"
+    return "Data"
+
+
+def is_nullable_type(clickhouse_type: str) -> bool:
+    """Return ``True`` if a live column accepts NULL."""
+    return _strip_wrappers(clickhouse_type)[1]
+
+
+def empty_value_for(clickhouse_type: str) -> Any:
+    """The value to write for NULL into a *non-nullable* live column.
+
+    ClickHouse itself uses these defaults for a missing value. Writing them is
+    better than failing the whole batch on a column created by an older
+    version of this app (which made mandatory fields non-nullable).
+    """
+    base, _nullable = _strip_wrappers(clickhouse_type)
+    if base.startswith("Decimal"):
+        return Decimal(0)
+    if re.match(r"^U?Int\d+$", base):
+        return 0
+    if base.startswith("Float"):
+        return 0.0
+    if base.startswith("DateTime"):
+        return _dt.datetime(1970, 1, 1)
+    if base.startswith("Date"):
+        return _dt.date(1970, 1, 1)
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# Time zones
+# --------------------------------------------------------------------------- #
+# ``clickhouse-connect`` turns a NAIVE datetime into an epoch with
+# ``datetime.timestamp()``, i.e. in the worker's OS time zone, while Frappe's
+# naive values are in Frappe's *system* time zone. When the two differ every
+# timestamp is shifted. New tables therefore declare Frappe's time zone on
+# their DateTime columns and the engine sends aware datetimes to them. Columns
+# created without a time zone keep the old behaviour, so their existing rows
+# and new rows stay consistent.
+_TZ_NAME_RE = re.compile(r"^[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)*$")
+_DATETIME_TZ_RE = re.compile(r"^DateTime(?:64)?\(\s*(?:\d+\s*,\s*)?'([^']+)'\s*\)$")
+
+
+def valid_timezone(name: str | None) -> str | None:
+    """Return ``name`` if it is a usable IANA time zone, else ``None``."""
+    if not name or not _TZ_NAME_RE.match(name):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - unknown zone or no tz database
+        return None
+    return name
+
+
+def with_timezone(clickhouse_type: str, timezone: str | None) -> str:
+    """``DateTime64(6)`` -> ``DateTime64(6, 'Zone')`` (other types unchanged)."""
+    if not timezone:
+        return clickhouse_type
+    match = re.match(r"^DateTime64\(\s*(\d+)\s*\)$", clickhouse_type)
+    if match:
+        return f"DateTime64({match.group(1)}, '{timezone}')"
+    if clickhouse_type == "DateTime":
+        return f"DateTime('{timezone}')"
+    return clickhouse_type
+
+
+def column_timezone(clickhouse_type: str) -> str | None:
+    """The explicit time zone of a live DateTime column, if it has one."""
+    base, _nullable = _strip_wrappers(clickhouse_type)
+    match = _DATETIME_TZ_RE.match(base)
+    return valid_timezone(match.group(1)) if match else None
+
+
+def strip_timezone(clickhouse_type: str) -> str:
+    """Drop a DateTime time zone, for comparing types (not for DDL)."""
+    return re.sub(
+        r"DateTime(64)?\(\s*(\d+)?\s*,?\s*'[^']*'\s*\)",
+        lambda m: f"DateTime64({m.group(2)})" if m.group(1) else "DateTime",
+        clickhouse_type,
+    )
+
+
+def attach_timezone(value: Any, timezone: str) -> Any:
+    """Make a naive ``datetime`` aware in ``timezone``; other values unchanged."""
+    if isinstance(value, _dt.datetime) and value.tzinfo is None:
+        from zoneinfo import ZoneInfo
+
+        return value.replace(tzinfo=ZoneInfo(timezone))
+    return value

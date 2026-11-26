@@ -1,16 +1,14 @@
 {
  "creation": "2026-01-01 00:00:00.000000",
  "doctype": "Number Card",
- "document_type": "ClickHouse Sync Log",
- "filters_json": "[[\"ClickHouse Sync Log\",\"status\",\"=\",\"Running\",false]]",
- "function": "Count",
  "is_public": 1,
  "is_standard": 1,
  "label": "Running Syncs",
+ "method": "clickhouse_sync.api.api.running_syncs_card",
  "module": "ClickHouse Warehouse",
- "modified": "2026-01-01 00:00:00.000000",
+ "modified": "2026-11-26 00:00:00.000000",
  "name": "Running Syncs",
  "owner": "Administrator",
  "show_percentage_stats": 0,
- "type": "Document Type"
+ "type": "Custom"
 }

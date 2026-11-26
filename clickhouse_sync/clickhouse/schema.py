@@ -21,9 +21,10 @@ operator decision.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import frappe
 
@@ -35,8 +36,12 @@ from clickhouse_sync.clickhouse.type_mapping import (
     KEY_COLUMNS,
     ColumnDefinition,
     build_column_definition,
+    fieldtype_for_clickhouse_type,
+    is_nullable_type,
     is_stored_field,
-    map_fieldtype,
+    strip_timezone,
+    valid_timezone,
+    with_timezone,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -73,21 +78,13 @@ CHILD_LINK_COLUMNS: tuple[tuple[str, str, str], ...] = (
 SOFT_DELETE_COLUMN = "_ch_is_deleted"
 SYNC_TIMESTAMP_COLUMN = "_ch_synced_at"
 
-# Rank of ClickHouse numeric families for compatible widening decisions.
-# A migration is only allowed when the target rank >= source rank *within*
-# the same family (int->int, float->float, string is universal sink).
-_WIDENING_RANK: dict[str, int] = {
-    "Int8": 1,
-    "Int16": 2,
-    "Int32": 3,
-    "Int64": 4,
-    "UInt8": 1,
-    "UInt16": 2,
-    "UInt32": 3,
-    "UInt64": 4,
-    "Float32": 5,
-    "Float64": 6,
-}
+# Rank of ClickHouse numeric types for compatible widening decisions. Signed,
+# unsigned and floating-point types are separate families: moving between
+# them is only allowed where every value still fits (see _can_widen).
+_INT_RANK: dict[str, int] = {"Int8": 1, "Int16": 2, "Int32": 3, "Int64": 4, "Int128": 5, "Int256": 6}
+_UINT_RANK: dict[str, int] = {"UInt8": 1, "UInt16": 2, "UInt32": 3, "UInt64": 4, "UInt128": 5, "UInt256": 6}
+_FLOAT_RANK: dict[str, int] = {"Float32": 1, "Float64": 2}
+_DECIMAL_RE = re.compile(r"^Decimal(?:\d+)?\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$")
 
 # Process-local metadata cache: table name -> (timestamp, live column map).
 _SCHEMA_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
@@ -100,6 +97,26 @@ _SCHEMA_CACHE_TTL = 300  # seconds
 # idempotent: re-running it replaces each row's prior copy instead of stacking
 # duplicates. Queries can add FINAL to force deduplication at read time.
 DEFAULT_ENGINE = "ReplacingMergeTree"
+
+# Optional partitioning for large tables. ``creation`` never changes, so a
+# record always stays in one partition and ReplacingMergeTree (which only
+# deduplicates within a partition) still keeps one row per record. It lets an
+# incremental run OPTIMIZE just the months it wrote to instead of the table.
+CREATION_PARTITION_EXPRESSION = "toYYYYMM(assumeNotNull(`creation`))"
+
+
+def system_timezone() -> str | None:
+    """Frappe's system time zone (System Settings), if it is a valid zone."""
+    try:
+        from frappe.utils import get_system_timezone
+
+        return valid_timezone(get_system_timezone())
+    except Exception:  # noqa: BLE001 - outside a site, or older Frappe
+        pass
+    try:
+        return valid_timezone(frappe.db.get_single_value("System Settings", "time_zone"))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @dataclass
@@ -217,6 +234,8 @@ def build_table_schema(
     include_soft_delete: bool = False,
     exclude_fields: "set[str] | frozenset[str] | None" = None,
     is_child: bool = False,
+    partition_by_creation: bool = False,
+    timezone: str | None = "system",
 ) -> TableSchema:
     """Build the desired :class:`TableSchema` from a DocType's metadata.
 
@@ -234,6 +253,11 @@ def build_table_schema(
             excluded regardless of this argument.
         is_child: When ``True`` the parent/parenttype/parentfield link columns
             are added so the synced child table can be joined to its parent.
+        partition_by_creation: Partition by creation month instead of a
+            single partition (applies when the table is created).
+        timezone: Time zone declared on DateTime columns of a new table.
+            ``"system"`` (default) uses Frappe's system time zone; ``None``
+            declares none.
 
     Returns:
         A populated :class:`TableSchema`.
@@ -241,6 +265,7 @@ def build_table_schema(
     meta = frappe.get_meta(doctype)
     columns: list[ColumnDefinition] = []
     seen: set[str] = set()
+    tz = system_timezone() if timezone == "system" else valid_timezone(timezone)
 
     # Normalise the exclusion set; protected columns can never be dropped.
     excluded = {f.strip() for f in (exclude_fields or set()) if f and f.strip()}
@@ -256,7 +281,7 @@ def build_table_schema(
         columns.append(
             ColumnDefinition(
                 name=fieldname,
-                clickhouse_type=ch_type,
+                clickhouse_type=with_timezone(ch_type, tz),
                 frappe_fieldtype=frappe_type,
                 nullable=nullable,
             )
@@ -275,14 +300,22 @@ def build_table_schema(
         # Password fieldtype always holds secret material - never mirror it.
         if getattr(df, "fieldtype", None) == "Password":
             continue
-        columns.append(build_column_definition(df))
+        col = build_column_definition(df)
+        if df.fieldtype == "Datetime":
+            col = ColumnDefinition(
+                name=col.name,
+                clickhouse_type=with_timezone(col.clickhouse_type, tz),
+                frappe_fieldtype=col.frappe_fieldtype,
+                nullable=col.nullable,
+            )
+        columns.append(col)
         seen.add(df.fieldname)
 
     # 3. Engine-managed markers.
     columns.append(
         ColumnDefinition(
             name=SYNC_TIMESTAMP_COLUMN,
-            clickhouse_type="DateTime64(3)",
+            clickhouse_type=with_timezone("DateTime64(3)", tz),
             frappe_fieldtype="Datetime",
             nullable=False,
         )
@@ -313,7 +346,7 @@ def build_table_schema(
     # Plain MergeTree keeps the original composite key and month partitioning.
     if resolved_engine.startswith("ReplacingMergeTree"):
         order_by: tuple[str, ...] = ("name",)
-        partition_by = "tuple()"
+        partition_by = CREATION_PARTITION_EXPRESSION if partition_by_creation else "tuple()"
     else:
         order_by = KEY_COLUMNS
         partition_by = "toYYYYMM(modified)"
@@ -374,6 +407,23 @@ def invalidate_schema_cache(table_name: str | None = None) -> None:
         _SCHEMA_CACHE.pop(key, None)
 
 
+def partition_key(client: "Client", database: str, table_name: str) -> str:
+    """The live table's partition key expression ('' if unpartitioned)."""
+    result = client.query(
+        "SELECT partition_key FROM system.tables "
+        "WHERE database = {db:String} AND name = {tbl:String}",
+        parameters={"db": database, "tbl": table_name},
+    )
+    rows = result.result_rows or []
+    return str(rows[0][0] or "") if rows else ""
+
+
+def is_creation_partitioned(client: "Client", database: str, table_name: str) -> bool:
+    """``True`` if the live table is partitioned by creation month."""
+    key = partition_key(client, database, table_name).replace("`", "").replace(" ", "")
+    return "toYYYYMM(" in key and "creation" in key
+
+
 def table_exists(client: "Client", database: str, table_name: str) -> bool:
     """Return ``True`` if the physical table already exists in ClickHouse."""
     result = client.query(
@@ -422,6 +472,11 @@ def ensure_table(
     return True
 
 
+def _comparable(clickhouse_type: str) -> str:
+    """Base type without ``Nullable`` and without a DateTime time zone."""
+    return strip_timezone(_base_type(clickhouse_type))
+
+
 def _base_type(clickhouse_type: str) -> str:
     """Strip a ``Nullable(...)`` wrapper to get the underlying base type."""
     t = clickhouse_type.strip()
@@ -430,11 +485,28 @@ def _base_type(clickhouse_type: str) -> str:
     return t
 
 
+def _decimal_parts(clickhouse_type: str) -> tuple[int, int] | None:
+    """Return ``(precision, scale)`` for a Decimal type string, else ``None``."""
+    match = _DECIMAL_RE.match(clickhouse_type.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
 def _can_widen(current: str, desired: str) -> bool:
     """Return ``True`` if migrating ``current`` -> ``desired`` is a safe widen.
 
-    Widening to ``String`` is always allowed (universal sink). Numeric
-    widening is allowed within the same broad family and only upward in rank.
+    Every value of the current type must be representable in the desired one:
+
+    * anything -> ``String`` (universal sink);
+    * within a family (signed, unsigned, float) only upward;
+    * unsigned -> a strictly larger signed type (``UInt32`` -> ``Int64``);
+    * integers of 32 bits or fewer -> ``Float64`` (exact up to 2**53);
+    * ``Decimal(P, S)`` -> ``Decimal(P2, S2)`` keeping at least as many
+      integer and fractional digits.
+
+    ``UInt64`` -> ``Int64`` (overflow) and ``Int64`` -> ``Float32`` (precision
+    loss) are refused.
     """
     cur = _base_type(current)
     des = _base_type(desired)
@@ -442,10 +514,17 @@ def _can_widen(current: str, desired: str) -> bool:
         return False  # nothing to do
     if des == "String":
         return True
-    cur_rank = _WIDENING_RANK.get(cur)
-    des_rank = _WIDENING_RANK.get(des)
-    if cur_rank is not None and des_rank is not None:
-        return des_rank >= cur_rank
+    for family in (_INT_RANK, _UINT_RANK, _FLOAT_RANK):
+        if cur in family and des in family:
+            return family[des] >= family[cur]
+    if cur in _UINT_RANK and des in _INT_RANK:
+        return _INT_RANK[des] > _UINT_RANK[cur]
+    if des == "Float64" and (_INT_RANK.get(cur, 99) <= 3 or _UINT_RANK.get(cur, 99) <= 3):
+        return True
+    cur_dec, des_dec = _decimal_parts(cur), _decimal_parts(des)
+    if cur_dec and des_dec:
+        (p1, s1), (p2, s2) = cur_dec, des_dec
+        return s2 >= s1 and (p2 - s2) >= (p1 - s1)
     return False
 
 
@@ -478,7 +557,10 @@ def diff_schema(
             continue
 
         desired_type = col.ddl.split(" ", 1)[1]  # strip the `name` prefix
-        if _base_type(live_type) == _base_type(desired_type):
+        if _comparable(live_type) == _comparable(desired_type):
+            # Same type. A time zone difference alone (a table created before
+            # time zones were declared) is not migrated: rewriting the column
+            # would not change the stored instants.
             continue
         if _can_widen(live_type, desired_type):
             diff.widened.append((col.name, live_type, desired_type))
@@ -522,10 +604,17 @@ def reconcile_schema(
                 f"ADD COLUMN failed for {schema.table_name}.{col.name}: {exc}"
             ) from exc
 
-    for col_name, _from, to_type in diff.widened:
+    for col_name, from_type, to_type in diff.widened:
+        # Keep the column nullable if it is now, or should be. Dropping the
+        # ``Nullable`` wrapper turned existing NULLs into 0 and made every
+        # later NULL insert fail.
+        nullable = is_nullable_type(from_type) or to_type.startswith("Nullable(")
+        rendered = _base_type(to_type)
+        if nullable:
+            rendered = f"Nullable({rendered})"
         alter = (
             f"ALTER TABLE `{database}`.`{schema.table_name}` "
-            f"MODIFY COLUMN `{col_name}` {_base_type(to_type)}"
+            f"MODIFY COLUMN `{col_name}` {rendered}"
         )
         try:
             client.command(alter)
@@ -549,3 +638,50 @@ def _log_ignored(schema: TableSchema, diff: SchemaDiff) -> None:
             f"Ignoring incompatible schema change for "
             f"{schema.table_name}.{col_name}: {from_type} !-> {to_type}"
         )
+
+
+def insert_columns(
+    client: "Client",
+    schema: TableSchema,
+    database: str,
+) -> list[ColumnDefinition]:
+    """The columns to insert into, described by what the live table holds.
+
+    Call after :func:`reconcile_schema`. For every desired column that exists
+    in the live table, the returned definition carries the *live* type and
+    nullability, and a conversion that suits it:
+
+    * a column the schema layer could not migrate (e.g. a field changed from
+      Data to Int over an existing ``String`` column) is converted for the
+      live type instead of failing every insert;
+    * a column missing from the live table (auto-update disabled, or an
+      ignored change) is left out rather than failing the insert;
+    * a non-nullable live column (created by an older version for a
+      mandatory field) is marked non-nullable so NULLs get its empty value.
+
+    If the live columns cannot be determined at all, the desired schema is
+    returned unchanged.
+    """
+    live = _live_columns(client, database, schema.table_name)
+    if not live:
+        return list(schema.columns)
+    columns: list[ColumnDefinition] = []
+    for col in schema.columns:
+        live_type = live.get(col.name)
+        if live_type is None:
+            continue
+        desired_base = _comparable(col.ddl.split(" ", 1)[1])
+        fieldtype = (
+            col.frappe_fieldtype
+            if _comparable(live_type) == desired_base
+            else fieldtype_for_clickhouse_type(live_type)
+        )
+        columns.append(
+            ColumnDefinition(
+                name=col.name,
+                clickhouse_type=live_type,
+                frappe_fieldtype=fieldtype,
+                nullable=is_nullable_type(live_type),
+            )
+        )
+    return columns

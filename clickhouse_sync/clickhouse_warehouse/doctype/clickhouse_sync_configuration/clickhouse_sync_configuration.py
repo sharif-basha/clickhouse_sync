@@ -20,8 +20,6 @@ from clickhouse_sync.clickhouse import schema as ch_schema
 from clickhouse_sync.clickhouse import sync_engine
 from clickhouse_sync.clickhouse.sync_engine import parse_excluded_fields
 
-VALID_BATCH_SIZES = (10000, 25000, 50000)
-
 
 class ClickHouseSyncConfiguration(Document):
     """One DocType-to-ClickHouse synchronisation configuration."""
@@ -40,6 +38,65 @@ class ClickHouseSyncConfiguration(Document):
             self.delete_strategy = "Ignore"
         if not self.sync_mode:
             self.sync_mode = "Incremental"
+        # The scheduler ticks every 15 minutes; shorter intervals mean "every tick".
+        if cint(self.get("sync_interval_minutes")) < 15:
+            self.sync_interval_minutes = 15
+        lag = self.get("cursor_safety_lag_seconds")
+        if lag is None or lag == "" or cint(lag) < 0:
+            self.cursor_safety_lag_seconds = sync_engine.CURSOR_SAFETY_LAG_SECONDS
+        elif cint(lag) > sync_engine.MAX_CURSOR_SAFETY_LAG_SECONDS:
+            self.cursor_safety_lag_seconds = sync_engine.MAX_CURSOR_SAFETY_LAG_SECONDS
+        self._validate_source_doctype()
+
+    def _validate_source_doctype(self) -> None:
+        """Only real, readable, table-backed DocTypes can be synced.
+
+        * Single and virtual DocTypes have no ``tab<DocType>`` table.
+        * Child DocTypes are synced through their parent's *Sync Child
+          Tables* option (they need the parent's ``parenttype`` filter).
+        * The person saving must be able to read the DocType: a
+          configuration copies every record into the warehouse, so without
+          this check the sync role could read any DocType there, bypassing
+          Frappe's own permissions.
+        * Two DocTypes must not map to the same ClickHouse table.
+        """
+        if not self.source_doctype:
+            return
+        meta = frappe.get_meta(self.source_doctype)
+        if cint(getattr(meta, "issingle", 0)):
+            frappe.throw(_("{0} is a Single DocType and has no table to sync.").format(self.source_doctype))
+        if cint(getattr(meta, "is_virtual", 0)):
+            frappe.throw(_("{0} is a virtual DocType and has no table to sync.").format(self.source_doctype))
+        if cint(getattr(meta, "istable", 0)):
+            frappe.throw(
+                _("{0} is a child table. Sync its parent DocType with 'Sync Child Tables' enabled.").format(
+                    self.source_doctype
+                )
+            )
+        if not (frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_test):
+            if not frappe.has_permission(self.source_doctype, "read"):
+                frappe.throw(
+                    _("You need read permission on {0} to sync it.").format(self.source_doctype),
+                    frappe.PermissionError,
+                )
+        table = ch_schema.table_name_for(self.source_doctype)
+        for other in frappe.get_all(
+            "ClickHouse Sync Configuration",
+            filters={"name": ("!=", self.name or "")},
+            pluck="source_doctype",
+        ):
+            if other and ch_schema.table_name_for(other) == table:
+                frappe.throw(
+                    _("{0} and {1} would both be written to ClickHouse table {2}.").format(
+                        self.source_doctype, other, table
+                    )
+                )
+
+    def on_update(self) -> None:
+        sync_engine.clear_delete_strategy_cache()
+
+    def on_trash(self) -> None:
+        sync_engine.clear_delete_strategy_cache()
 
     @frappe.whitelist()
     def enqueue_sync(self, trigger: str = "Manual") -> dict:
@@ -52,20 +109,12 @@ class ClickHouseSyncConfiguration(Document):
         if not self.enabled:
             frappe.throw(_("Enable this configuration before syncing."))
 
-        job_id = f"clickhouse_sync::{self.name}"
-        if _job_already_running(job_id):
-            frappe.throw(_("A sync for {0} is already running.").format(self.name))
+        from clickhouse_sync.tasks import enqueue_config_sync
 
-        frappe.enqueue(
-            "clickhouse_sync.tasks.run_configuration_sync",
-            queue="long",
-            timeout=21600,  # 6 hours - large full syncs
-            job_id=job_id,
-            deduplicate=True,
-            config_name=self.name,
-            trigger=trigger,
-        )
-        return {"job_id": job_id, "configuration": self.name}
+        outcome = enqueue_config_sync(self.name, trigger=trigger, doctype=self.source_doctype)
+        if not outcome["queued"]:
+            frappe.throw(_("A sync for {0} is already queued or running.").format(self.name))
+        return {"job_id": outcome["job_id"], "configuration": self.name}
 
     @frappe.whitelist()
     def cancel_sync(self) -> dict:
@@ -120,15 +169,3 @@ class ClickHouseSyncConfiguration(Document):
         self.db_set("last_sync_timestamp", None, update_modified=False)
         return {"reset": True}
 
-
-def _job_already_running(job_id: str) -> bool:
-    """Return ``True`` if a background job with ``job_id`` is queued/running."""
-    try:
-        from frappe.utils.background_jobs import get_jobs
-
-        for jobs in get_jobs().values():
-            if job_id in jobs:
-                return True
-    except Exception:  # noqa: BLE001 - dedup check must never block the user
-        return False
-    return False

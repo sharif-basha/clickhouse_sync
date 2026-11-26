@@ -63,7 +63,7 @@ def _ensure_default_settings() -> None:
         settings.max_insert_block_size = 1048576
         changed = True
     if not settings.default_engine:
-        settings.default_engine = "MergeTree"
+        settings.default_engine = "ReplacingMergeTree"
         changed = True
     if changed:
         settings.flags.ignore_permissions = True

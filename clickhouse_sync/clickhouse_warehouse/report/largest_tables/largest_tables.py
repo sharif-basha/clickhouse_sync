@@ -10,6 +10,7 @@ import frappe
 from frappe import _
 
 from clickhouse_sync.clickhouse import connection as ch_connection
+from clickhouse_sync.clickhouse.warehouse_stats import readable_size, table_sizes
 
 
 def execute(filters: dict | None = None) -> tuple[list[dict], list[dict]]:
@@ -34,25 +35,8 @@ def execute(filters: dict | None = None) -> tuple[list[dict], list[dict]]:
         frappe.msgprint(_("ClickHouse unreachable: {0}").format(str(exc)))
         return columns, []
 
-    result = client.query(
-        """
-        SELECT
-            table,
-            sum(rows) AS rows,
-            formatReadableSize(sum(bytes_on_disk)) AS size,
-            sum(bytes_on_disk) AS bytes,
-            count() AS parts
-        FROM system.parts
-        WHERE database = {db:String} AND active
-        GROUP BY table
-        ORDER BY bytes DESC
-        LIMIT 100
-        """,
-        parameters={"db": database},
-    )
-
     data: list[dict[str, Any]] = [
-        {"table": r[0], "rows": r[1], "size": r[2], "bytes": r[3], "parts": r[4]}
-        for r in result.result_rows
+        {**t, "size": readable_size(t["bytes"])}
+        for t in table_sizes(client, database, limit=100)
     ]
     return columns, data

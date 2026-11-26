@@ -17,6 +17,7 @@ Key behaviours:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import time
@@ -26,8 +27,10 @@ from typing import TYPE_CHECKING, Any
 import frappe
 
 from clickhouse_sync.clickhouse.exceptions import (
+    CONFIGURATION_CLICKHOUSE_CODES,
     ClickHouseConfigurationError,
     ClickHouseConnectionError,
+    clickhouse_error_code,
     is_transient_error,
 )
 
@@ -43,6 +46,7 @@ _CACHE_LOCK = threading.RLock()
 
 DEFAULT_CONNECT_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 0.5  # seconds
+DEFAULT_CONNECT_TIMEOUT = 10  # seconds
 
 
 @dataclass(frozen=True)
@@ -68,11 +72,22 @@ class ClickHouseConnectionParams:
 
     @property
     def fingerprint(self) -> str:
-        """Return a stable cache key that never leaks the password."""
+        """Return a stable cache key that never leaks the password.
+
+        Every parameter takes part - including the password (as a hash) and
+        the timeouts - so a worker that already holds a client notices a
+        settings change on its next ``get_client`` call. Keying on the
+        endpoint alone kept workers on the old password: ClickHouse's
+        ``/ping`` needs no authentication, so the stale client still looked
+        healthy while every query failed with an authentication error.
+        """
+        secret = hashlib.sha256(self.password.encode("utf-8")).hexdigest()[:16]
         return (
             f"{self.host}:{self.port}/{self.database}"
             f"?user={self.username}&secure={int(self.secure)}"
-            f"&compress={int(self.compression)}&pid={os.getpid()}"
+            f"&compress={int(self.compression)}&ct={self.connect_timeout}"
+            f"&srt={self.send_receive_timeout}&mt={self.max_threads}"
+            f"&mibs={self.max_insert_block_size}&pw={secret}&pid={os.getpid()}"
         )
 
     def settings(self) -> dict[str, Any]:
@@ -115,7 +130,7 @@ def get_connection_params() -> ClickHouseConnectionParams:
         password=password,
         secure=bool(settings.secure),
         compression=bool(settings.compression) if settings.compression is not None else True,
-        connect_timeout=int(settings.connection_timeout or DEFAULT_CONNECT_RETRIES * 10),
+        connect_timeout=int(settings.connection_timeout or DEFAULT_CONNECT_TIMEOUT),
         send_receive_timeout=int(getattr(settings, "send_receive_timeout", 0) or 300),
         max_threads=int(settings.max_threads or 0),
         max_insert_block_size=int(settings.max_insert_block_size or 1048576),
@@ -156,6 +171,13 @@ def _build_client(params: ClickHouseConnectionParams) -> "Client":
             query_limit=0,  # never truncate streaming query results
         )
     except Exception as exc:  # noqa: BLE001 - normalise to our hierarchy
+        # A wrong user/password is a settings problem, not a network one:
+        # report it as such so it is neither retried nor shown as "Connection".
+        if clickhouse_error_code(exc) in CONFIGURATION_CLICKHOUSE_CODES:
+            raise ClickHouseConfigurationError(
+                f"ClickHouse rejected the credentials for {params.username}@"
+                f"{params.host}:{params.port} - {exc}"
+            ) from exc
         raise ClickHouseConnectionError(
             f"Could not connect to ClickHouse at {params.host}:{params.port} - {exc}"
         ) from exc
@@ -204,6 +226,10 @@ def get_client(force_new: bool = False, retries: int | None = None) -> "Client":
         client = _connect_with_retry(
             params, retries=retries if retries is not None else DEFAULT_CONNECT_RETRIES
         )
+        # Settings changed (or this is the first client): drop clients built
+        # from older settings so they are closed instead of leaking.
+        for stale_key in [k for k in _CLIENT_CACHE if k != key]:
+            _close_silently(_CLIENT_CACHE.pop(stale_key))
         _CLIENT_CACHE[key] = client
         return client
 
@@ -229,7 +255,7 @@ def _connect_with_retry(
 
     raise ClickHouseConnectionError(
         f"Failed to connect to ClickHouse after {retries} attempt(s): {last_exc}"
-    )
+    ) from last_exc
 
 
 def _close_silently(client: "Client") -> None:

@@ -58,6 +58,12 @@ def ensure_frappe_importable() -> None:
     utils_stub.cint = _cint
     utils_stub.get_datetime = _get_datetime
     utils_stub.now_datetime = dt.datetime.now
+    utils_stub.add_days = lambda d, n: d + dt.timedelta(days=n)
+    utils_stub.getdate = lambda d=None: (
+        dt.date.fromisoformat(d) if isinstance(d, str) else (d or dt.date.today())
+    )
+    utils_stub.today = lambda: dt.date.today().isoformat()
+    utils_stub.add_to_date = lambda d, **kw: d + dt.timedelta(**kw)
     frappe_stub.utils = utils_stub
     def whitelist(*args: Any, **kwargs: Any) -> Any:
         def decorate(fn: Any) -> Any:
@@ -104,6 +110,16 @@ class Clock:
         return self.now
 
 
+class CallbackList:
+    """Stand-in for ``frappe.db.after_commit``: runs callbacks on commit."""
+
+    def __init__(self) -> None:
+        self.callbacks: list[Callable[[], None]] = []
+
+    def add(self, callback: Callable[[], None]) -> None:
+        self.callbacks.append(callback)
+
+
 class FakeDB:
     """Runs the engine's MariaDB-style SQL on SQLite."""
 
@@ -115,6 +131,9 @@ class FakeDB:
         self.queries: list[str] = []
         self.query_log: list[tuple[str, dict[str, Any]]] = []
         self.before_query: Callable[[str, dict], None] | None = None
+        self.after_commit = CallbackList()
+        self.commits = 0
+        self.rollbacks = 0
 
     # -- table helpers ----------------------------------------------------- #
     def create_table(self, doctype: str, columns: list[str]) -> None:
@@ -200,7 +219,14 @@ class FakeDB:
             )
 
     def commit(self) -> None:
-        pass
+        self.commits += 1
+        callbacks, self.after_commit.callbacks = self.after_commit.callbacks, []
+        for callback in callbacks:
+            callback()
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+        self.after_commit.callbacks = []
 
     def get_value(self, *args: Any, **kwargs: Any) -> Any:
         if not args:
@@ -259,6 +285,11 @@ class FakeClickHouse:
 
     def __init__(self) -> None:
         self.tables: dict[str, dict[str, dict[str, Any]]] = {}
+        # Live column types per table, as CREATE / ALTER statements left them.
+        # Tables created by a test directly have no entry (columns unknown).
+        self.columns: dict[str, dict[str, str]] = {}
+        self.queries: list[tuple[str, dict[str, Any]]] = []
+        self.partition_keys: dict[str, str] = {}
         self.commands: list[str] = []
         self.command_calls: list[tuple[str, dict[str, Any]]] = []
         self.insert_log: list[tuple[str, int]] = []
@@ -290,8 +321,22 @@ class FakeClickHouse:
         match = re.search(r"CREATE TABLE IF NOT EXISTS `[^`]+`\.`([^`]+)`", sql)
         if match:
             self.tables.setdefault(match.group(1), {})
+            part = re.search(r"PARTITION BY (.+)\n", sql)
+            if part and part.group(1).strip() != "tuple()":
+                self.partition_keys[match.group(1)] = part.group(1).replace("`", "")
+            body = sql.split("(", 1)[1].rsplit("ENGINE", 1)[0]
+            self.columns[match.group(1)] = {
+                m.group(1): m.group(2).strip().rstrip(",").strip()
+                for m in re.finditer(r"^\s*`([^`]+)` (.+?),?\s*$", body, re.MULTILINE)
+            }
             return
-        match = re.search(r"(?:ALTER TABLE|DELETE FROM) `[^`]+`\.`([^`]+)`", sql)
+        match = re.search(
+            r"ALTER TABLE `[^`]+`\.`([^`]+)` (?:ADD COLUMN IF NOT EXISTS|MODIFY COLUMN) `([^`]+)` (.+)$", sql
+        )
+        if match:
+            self.columns.setdefault(match.group(1), {})[match.group(2)] = match.group(3).strip()
+            return
+        match = re.search(r"(?:ALTER TABLE|DELETE FROM|INSERT INTO) `[^`]+`\.`([^`]+)`", sql)
         if not match:
             return
         table = self.tables.get(match.group(1), {})
@@ -304,9 +349,9 @@ class FakeClickHouse:
                 name for name in names
                 if name in table and table[name].get("parenttype") == parenttype
             ]
-        if "UPDATE `_ch_is_deleted` = 1" in sql:
+        if "UPDATE `_ch_is_deleted` = 1" in sql or "toUInt8(1) AS `_ch_is_deleted`" in sql:
             for name in names:
-                if name in table:
+                if name in table and not table[name].get("_ch_is_deleted"):
                     table[name]["_ch_is_deleted"] = 1
         else:
             for name in names:
@@ -315,6 +360,22 @@ class FakeClickHouse:
     def query(self, sql: str, parameters: dict | None = None, settings: dict | None = None) -> Any:
         if self.fail_queries:
             raise ConnectionRefusedError("connection refused")
+        self.queries.append((sql, dict(parameters or {})))
+        live_only = "`_ch_is_deleted` = 0" in sql
+        if "`parent` IN {parents:Array(String)}" in sql:
+            table = sql.split("`.`")[1].split("`")[0]
+            params = parameters or {}
+            names = sorted(
+                name
+                for name, row in self.tables.get(table, {}).items()
+                if row.get("parenttype") == params.get("source_parenttype")
+                and row.get("parent") in params.get("parents", [])
+                and not (live_only and row.get("_ch_is_deleted"))
+            )
+            return types.SimpleNamespace(result_rows=[[name] for name in names])
+        if "partition_key FROM system.tables" in sql:
+            table = (parameters or {}).get("tbl")
+            return types.SimpleNamespace(result_rows=[[self.partition_keys.get(table, "")]])
         if "system.tables" in sql:
             table = (parameters or {}).get("tbl")
             if table is None:
@@ -333,6 +394,7 @@ class FakeClickHouse:
                 for name, row in self.tables.get(table, {}).items()
                 if name > params.get("last_name", "")
                 and (parenttype is None or row.get("parenttype") == parenttype)
+                and not (live_only and row.get("_ch_is_deleted"))
             )
             names = names[: params.get("limit", len(names))]
             return types.SimpleNamespace(result_rows=[[name] for name in names])
@@ -343,7 +405,10 @@ class FakeClickHouse:
                 rows = [r for r in rows if not r.get("_ch_is_deleted")]
             return types.SimpleNamespace(result_rows=[[len(list(rows))]])
         if "system.columns" in sql:
-            return types.SimpleNamespace(result_rows=[])
+            table = (parameters or {}).get("tbl")
+            return types.SimpleNamespace(
+                result_rows=[[n, t] for n, t in self.columns.get(table, {}).items()]
+            )
         if "SELECT DISTINCT `name`" in sql:
             table = sql.split("`.`")[1].split("`")[0]
             return types.SimpleNamespace(result_rows=[[n] for n in self.tables.get(table, {})])
@@ -386,6 +451,21 @@ class FakeRedisCache:
         self.local.pop(full, None)
         self.shared.pop(full, None)
 
+    # Redis lists (RedisWrapper.rpush / lrange / ltrim); values come back as
+    # bytes, like the real client.
+    def rpush(self, key: str, value: Any) -> None:
+        item = value.encode("utf-8") if isinstance(value, str) else value
+        self.shared.setdefault(self.make_key(key), []).append(item)
+
+    def lrange(self, key: str, start: int, end: int) -> list:
+        items = self.shared.get(self.make_key(key), [])
+        return list(items[start : None if end == -1 else end + 1])
+
+    def ltrim(self, key: str, start: int, end: int) -> None:
+        full = self.make_key(key)
+        items = self.shared.get(full, [])
+        self.shared[full] = list(items[start : None if end == -1 else end + 1])
+
 
 class FakeFrappe:
     """The subset of the ``frappe`` API the engine modules touch."""
@@ -405,7 +485,8 @@ class FakeFrappe:
         # ``cache`` is the per-job copy Frappe keeps in front of Redis.
         self.local = types.SimpleNamespace(site="test.site", cache={})
         self.utils = types.SimpleNamespace(
-            escape_html=lambda s: s, now_datetime=clock, cint=_cint, get_datetime=_get_datetime
+            escape_html=lambda s: s, now_datetime=clock, cint=_cint, get_datetime=_get_datetime,
+            add_to_date=lambda d, **kw: d + dt.timedelta(**kw),
         )
 
     def get_meta(self, doctype: str) -> FakeMeta:
@@ -475,6 +556,7 @@ class EngineHarness:
 
     def __init__(self, testcase: Any, batch_size: int = 2) -> None:
         from clickhouse_sync.api import dashboard
+        from clickhouse_sync import tasks
         from clickhouse_sync.clickhouse import alerts, connection, live_status, schema, sync_engine
 
         self.dashboard = dashboard
@@ -497,6 +579,7 @@ class EngineHarness:
         schema._SCHEMA_CACHE.clear()
         patches = [
             mock.patch.object(sync_engine, "frappe", self.frappe),
+            mock.patch.object(tasks, "frappe", self.frappe),
             mock.patch.object(schema, "frappe", self.frappe),
             mock.patch.object(alerts, "frappe", self.frappe),
             mock.patch.object(live_status, "frappe", self.frappe),

@@ -35,7 +35,8 @@ class TestTypeMapping(unittest.TestCase):
     def test_numeric_mappings(self) -> None:
         self.assertEqual(tm.map_fieldtype("Int"), "Int64")
         self.assertEqual(tm.map_fieldtype("Float"), "Float64")
-        self.assertEqual(tm.map_fieldtype("Currency"), "Decimal(21, 6)")
+        # Same scale as Frappe's decimal(21, 9) storage: no digits lost.
+        self.assertEqual(tm.map_fieldtype("Currency"), "Decimal(21, 9)")
 
     def test_non_stored_fieldtypes_skipped(self) -> None:
         df = SimpleNamespace(fieldtype="Section Break", fieldname=None)
@@ -53,11 +54,13 @@ class TestTypeMapping(unittest.TestCase):
         self.assertTrue(col.nullable)
         self.assertIn("Nullable(String)", col.ddl)
 
-    def test_mandatory_field_not_nullable(self) -> None:
+    def test_mandatory_field_is_still_nullable(self) -> None:
+        # ``reqd`` is a form rule; source rows can hold NULL in such fields,
+        # and a non-nullable column made the whole batch fail.
         df = SimpleNamespace(fieldtype="Data", fieldname="title", reqd=1)
         col = tm.build_column_definition(df)
-        self.assertFalse(col.nullable)
-        self.assertNotIn("Nullable", col.ddl)
+        self.assertTrue(col.nullable)
+        self.assertIn("Nullable(String)", col.ddl)
 
     def test_key_columns_never_nullable(self) -> None:
         df = SimpleNamespace(fieldtype="Data", fieldname="name", reqd=0)
@@ -90,12 +93,12 @@ class TestTypeMapping(unittest.TestCase):
     def test_currency_default_precision_when_unset(self) -> None:
         df = SimpleNamespace(fieldtype="Currency", fieldname="amount", reqd=0, precision="")
         col = tm.build_column_definition(df)
-        self.assertIn("Decimal(21, 6)", col.ddl)
+        self.assertIn("Decimal(21, 9)", col.ddl)
 
     def test_currency_invalid_precision_falls_back(self) -> None:
         df = SimpleNamespace(fieldtype="Currency", fieldname="amount", reqd=0, precision="xx")
         col = tm.build_column_definition(df)
-        self.assertIn("Decimal(21, 6)", col.ddl)
+        self.assertIn("Decimal(21, 9)", col.ddl)
 
 
 if __name__ == "__main__":

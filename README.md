@@ -49,8 +49,9 @@ query without loading the production database.
 - **Duplicate-safe.** Tables use `ReplacingMergeTree` keyed on `name`;
   re-sending a record replaces the earlier version.
 - **Deletes.** Choose per DocType: *Ignore*, *Soft Delete* (flag the row) or
-  *Hard Delete* (remove it). Deletes are sent when a document is trashed and
-  reconciled on full syncs (optionally on incremental syncs too).
+  *Hard Delete* (remove it). A delete is queued once it has committed in
+  Frappe and applied in batches by a background job; full syncs (optionally
+  incremental syncs too) reconcile anything the queue missed.
 - **Child tables** can be synced alongside their parent (one ClickHouse table
   per child DocType).
 - **Resilient.** Transient failures (connection drops, ClickHouse memory
@@ -193,6 +194,7 @@ cached copy of the dashboard script.
 | Connection Timeout, Send/Receive Timeout | Seconds. |
 | Max Threads, Max Insert Block Size | Passed to ClickHouse as query settings. |
 | Staleness Alert Hours | See Telegram alerts. |
+| Log Retention Days | Sync Logs older than this are deleted daily (default 90; 0 keeps all). |
 | Alert Mode, Alert On, Telegram Bot Token, Telegram Chat ID | See Telegram alerts. |
 
 ### 2. ClickHouse Sync Configuration (one per DocType)
@@ -201,13 +203,16 @@ cached copy of the dashboard script.
 | --- | --- |
 | Source DocType | The DocType to copy. The table is named `tab_` + the DocType in lower case with spaces as `_` (for example `tab_sales_invoice`). |
 | Enabled / Scheduler Enabled / Priority | Disabled configurations are listed on the dashboard but not synced or totalled. Lower priority numbers are queued first. |
+| Sync Interval (Minutes) | How often the scheduler runs it (default 15). The scheduler ticks every 15 minutes; use 60, 360 or 1440 for large Full-mode DocTypes. |
 | Sync Mode | **Incremental** (recommended) or **Full**. |
+| Cursor Safety Lag (Seconds) | Incremental runs re-read this much before the saved position (default 300), for transactions that commit late. Raise it where long imports or submits run. |
 | Batch Size | Records per batch, kept between 1,000 and 100,000 (default 25,000). Use 5,000–10,000 for DocTypes with large text fields. |
 | Auto Create Table / Auto Update Schema | Create the table and add new columns automatically. |
-| Optimize After Sync / Optimize Only On Full | Run `OPTIMIZE TABLE … FINAL` after a run. This rewrites the table, so on large tables enable *Optimize Only On Full* and query with `FINAL`. |
+| Optimize After Sync / Optimize Only On Full | Run `OPTIMIZE TABLE … FINAL` after a run. This rewrites the whole table, so *Optimize Only On Full* is on by default for new configurations; query with `FINAL` between full syncs. |
 | Delete Strategy | Ignore, Soft Delete (`_ch_is_deleted = 1`) or Hard Delete. |
-| Reconcile Deletes (Incremental) | Also compare full key sets on incremental runs. Costly on large tables. |
+| Reconcile Deletes (Incremental) | Also compare full key sets on incremental runs. Costly on large tables. Without it, incremental runs still check the child rows of every parent changed in the run. |
 | Sync Child Tables | Copy the DocType's child tables too. |
+| Partition By Creation Month | For large DocTypes: partition the table (and its child tables) by creation month, so post-sync OPTIMIZE rewrites only the months a run touched. Applies when the table is created. |
 | Excluded Fields | Fields never copied (use the *Select Fields to Exclude* picker). Password fields and names such as `api_key`, `*_secret` and `*_token` are always excluded. |
 | Retry Count / Retry Interval | Attempts per run and the base wait in seconds, doubled per attempt. |
 | Last Sync Timestamp | The cursor; see [How a sync works](#how-a-sync-works). |
@@ -221,7 +226,9 @@ traceback. Reports: **Sync Summary**, **Failed Syncs**, **Slowest Syncs**,
 ### Roles
 
 **ClickHouse Sync Manager** (shipped as a fixture) and **System Manager** can
-use the dashboard, start and stop syncs and read logs.
+use the dashboard, start and stop syncs and read logs. Only **System Manager**
+can edit ClickHouse Settings. Saving a configuration requires read permission
+on its Source DocType.
 
 ## Day-to-day operation
 
@@ -253,15 +260,26 @@ WHERE docstatus = 1
 GROUP BY customer;
 ```
 
-With *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. `_ch_synced_at`
-records when each row was written.
+With *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. A soft delete is
+written as a new version of the row with the flag set, so `FINAL` is what
+makes the flag visible. `_ch_synced_at` records when each row was written.
+
+Tables created by this version declare Frappe's system time zone on their
+DateTime columns, so instants are correct whatever the server's OS time zone.
+Tables created earlier have no time zone: their values were written using the
+worker's OS time zone and are left as they are, so old and new rows agree.
 
 ## Security
 
 - Every API method checks for the System Manager or ClickHouse Sync Manager
   role. The dashboard's start and stop endpoints accept POST only.
-- ClickHouse and Telegram credentials are Password fields (encrypted at rest)
-  and never written to logs by this app.
+- ClickHouse Settings are System Manager only, and changing the host, port,
+  user or TLS setting requires re-entering the password, so the stored
+  password cannot be redirected to another server.
+- A configuration can only be saved by someone who can read its Source
+  DocType; Single, virtual and child DocTypes are rejected.
+- ClickHouse and Telegram credentials are Password fields (encrypted at rest).
+  Telegram errors are logged with the bot token removed.
 - Sensitive fields are excluded by name pattern and by the Excluded Fields
   list. The sync itself does not apply Frappe user permissions, so anyone who
   can query the ClickHouse database can read every synced DocType. Give BI
@@ -276,9 +294,7 @@ bench --site <site> set-config allow_tests true      # test/staging sites only
 bench --site <site> run-tests --app clickhouse_sync
 
 # Without a bench, from the app folder (Python 3.10+):
-python -m unittest clickhouse_sync.tests.test_stage1_fixes \
-  clickhouse_sync.tests.test_dashboard clickhouse_sync.tests.test_exceptions \
-  clickhouse_sync.tests.test_schema clickhouse_sync.tests.test_type_mapping
+python -m unittest discover -s clickhouse_sync/tests -t .
 ```
 
 The engine and dashboard tests run the real sync code against in-memory
@@ -301,12 +317,13 @@ clickhouse_sync/
 │   ├── schema.py          # table DDL, schema reconciliation, field exclusion
 │   ├── type_mapping.py    # Frappe field type -> ClickHouse type, value coercion
 │   ├── exceptions.py      # error types, transient/permanent classification, categories
+│   ├── warehouse_stats.py # table sizes from system.parts (shared by API, dashboard, report)
 │   └── alerts.py          # Telegram messages
 ├── api/
-│   ├── api.py             # configuration-form and legacy endpoints
+│   ├── api.py             # stable endpoints for the desk script, forms, cards, other apps
 │   └── dashboard.py       # dashboard endpoints
 ├── tasks.py               # scheduler and background-job entry points
-├── hooks.py               # scheduler events, on_trash hook, assets, fixtures
+├── hooks.py               # scheduler events, after_delete hook, assets, fixtures
 ├── clickhouse_warehouse/  # module: DocTypes, dashboard page, reports, workspace
 └── tests/
 ```
@@ -335,20 +352,27 @@ ClickHouse client and is reused by `ai_insights`.
 
 ## Known limitations
 
-These are documented in the audit report and scheduled for the next stages:
-
-- **Schedule.** Every scheduler-enabled configuration is queued every 15
-  minutes, and again hourly and daily; there is no per-configuration
-  frequency yet. Full-mode configurations therefore reload their whole table
-  on every tick: prefer Incremental, or turn off *Scheduler Enabled* for large
-  Full-mode DocTypes and run them on demand.
-- **Deletes** are sent to ClickHouse from inside the user's delete
-  transaction, one ClickHouse mutation per document. Child rows removed from
-  a parent are not deleted in ClickHouse, and renamed documents leave their
-  old name behind.
-- **Mandatory fields** become non-nullable ClickHouse columns; a NULL in such
-  a field in old data can make a batch fail.
-- **Per-run OPTIMIZE** rewrites the whole table when enabled.
+- **Schedule granularity** is the 15-minute scheduler tick: a *Sync
+  Interval* is rounded up to the next tick.
+- **Renamed documents** leave their old name behind until a Full sync with a
+  delete strategy reconciles it.
+- **Queued deletes** live in the Redis cache; a Redis restart loses the ones
+  not yet applied. Reconciliation repairs them.
+- **Per-run OPTIMIZE** on incremental runs (*Optimize Only On Full* off)
+  rewrites the whole table unless it is partitioned by creation month.
+- **Partitioning and time zones** are fixed when a table is created. To apply
+  *Partition By Creation Month* or a time zone to an existing table, drop it
+  in ClickHouse and run a Full sync.
+- **Delete reconciliation** pages through ClickHouse names and looks each page
+  up in MariaDB. A single anti-join would be faster, but MariaDB's
+  case-insensitive collation and ClickHouse's byte order sort names
+  differently, so range-based comparisons could flag live rows as deleted.
+- **Column changes** that cannot be migrated safely (for example a field
+  changed from Data to Int, or narrowing a type) are logged and the existing
+  column is kept; values are converted for the column that exists.
+- **Existing Currency columns** created by 1.7.0 keep 6 decimal places (new
+  tables use Frappe's 9). Widening them would allow fewer integer digits, so
+  it is not done automatically.
 - **Live dashboard state** lives in the Redis cache; a Redis restart clears
   it until the next run. Sync Logs are unaffected. A running sync's log is
   only written when it ends.
@@ -372,7 +396,83 @@ These are documented in the audit report and scheduled for the next stages:
 
 ## Changelog
 
-### Unreleased (branch `stage1-fixes`)
+### Unreleased (code review fixes, part 2)
+
+- **Per-configuration schedule:** *Sync Interval (Minutes)* lets large
+  Full-mode DocTypes run hourly or daily instead of every 15 minutes.
+- **Configurable overlap:** *Cursor Safety Lag (Seconds)* per configuration.
+- **Time zones:** new tables declare Frappe's system time zone and receive
+  aware datetimes; the driver had converted naive values with the worker's OS
+  time zone. Existing tables are unchanged.
+- **Soft deletes** are written as a new row version (`INSERT ... SELECT
+  FINAL`) instead of an `ALTER TABLE ... UPDATE` mutation.
+- **Partition By Creation Month** (opt-in, new tables): post-sync OPTIMIZE
+  rewrites only the months a run touched.
+- **Unconvertible values** (e.g. text in an Int field) are counted and
+  reported on the run instead of silently becoming NULL.
+- Delete reconciliation compares 5,000 names per round trip (was 1,000).
+- Dashboard: pending counts are cached for 60 s; the error category
+  breakdown covers up to 500 failed runs instead of the 25 listed; optimizing
+  and reconciling phases are not shown as stalled for up to 3 hours.
+- One shared batch reader for parent and child tables, one Redis read helper,
+  and one `system.parts` query for the API, dashboard and Largest Tables report.
+- One version number (`clickhouse_sync.__version__`) and one build system
+  (`pyproject.toml`); `setup.py` removed.
+
+**Upgrade notes.** Run `bench migrate` for the three new configuration
+fields. Nothing changes for existing tables until you opt in.
+
+### Unreleased (code review fixes)
+
+**Data correctness**
+
+- Deletes are queued only after the delete commits (`after_delete`) and
+  applied in batches by a background job. A delete Frappe refused ("linked
+  with ...") used to remove the row from ClickHouse anyway, and a ClickHouse
+  outage made every delete in the ERP hang.
+- Currency values are written as exact decimals (they went through `float`)
+  with Frappe's 9 decimal places; high precisions no longer overflow.
+- Widening a column keeps it `Nullable`; unsafe changes (`UInt64` → `Int64`,
+  `Int64` → `Float32`) are refused.
+- Inserts use the live column types: a type change that cannot be migrated,
+  or a missing column with Auto Update off, no longer fails every run.
+- New columns are nullable even for mandatory fields; NULLs in older
+  non-nullable columns get the column's empty value instead of failing.
+- Worker processes pick up a changed ClickHouse password immediately.
+
+**Performance**
+
+- Incremental runs check deleted child rows only for parents changed in the
+  run, instead of scanning the whole child table every 15 minutes.
+- Rows already soft-deleted are no longer flagged again on every run.
+- *Optimize Only On Full* defaults to on.
+- Sync Logs are purged after *Log Retention Days* (default 90); the log
+  table has indexes on configuration and status.
+- The redundant hourly and daily re-queueing was removed.
+
+**Reliability and monitoring**
+
+- Wrong credentials are reported as *Configuration* and not retried; MariaDB
+  errors are retried by error number (deadlock, lock wait, lost connection).
+- Retry backoff is capped at 5 minutes with jitter; a failed run rolls back
+  before its log is written.
+- "Running Syncs" counts come from live state (they were always 0).
+- Starting a sync that is already queued says so instead of reporting a run
+  that will not happen; re-queueing keeps the original queue time.
+- Child-table syncs report progress and can be cancelled.
+- Batch digests no longer report a failure twice or count cancelled runs.
+
+**Security**
+
+- ClickHouse Settings are System Manager only; endpoint changes require the
+  password again. Configurations require read access to the Source DocType.
+- The Telegram bot token is removed from logged and returned errors.
+
+**Upgrade notes.** Run `bench migrate` (new settings field, log indexes, the
+Running Syncs number card). Existing configurations keep their *Optimize
+Only On Full* value: turn it on for large incremental DocTypes.
+
+### Stage 1 fixes
 
 **Data correctness**
 

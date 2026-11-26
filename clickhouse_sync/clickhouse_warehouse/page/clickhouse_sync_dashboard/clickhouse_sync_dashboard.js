@@ -842,7 +842,14 @@ class ClickHouseSyncDashboard {
 		const go = () =>
 			frappe
 				.xcall(`${CHSYNC_API}.start_sync`, { configuration: config, mode })
-				.then(() => this._after_action(__("{0} sync queued for {1}", [__(mode), config])));
+				.then((r) =>
+					r.queued && r.queued.length
+						? this._after_action(__("{0} sync queued for {1}", [__(mode), config]))
+						: frappe.show_alert({
+								message: r.message || __("A sync for {0} is already queued or running.", [config]),
+								indicator: "orange",
+						  })
+				);
 		if (mode === "Full") {
 			frappe.confirm(
 				__("Run a full sync of {0}? Every record is read again; on a large table this takes a while and adds load to the database.", [`<b>${esc(config)}</b>`]),
@@ -862,7 +869,14 @@ class ClickHouseSyncDashboard {
 		frappe.confirm(text, () =>
 			frappe
 				.xcall(`${CHSYNC_API}.start_all`, { mode })
-				.then((r) => this._after_action(__("{0} sync(s) queued", [r.queued.length])))
+				.then((r) => {
+					const skipped = (r.skipped || []).length;
+					this._after_action(
+						skipped
+							? __("{0} sync(s) queued; {1} already queued or running", [r.queued.length, skipped])
+							: __("{0} sync(s) queued", [r.queued.length])
+					);
+				})
 		);
 	}
 

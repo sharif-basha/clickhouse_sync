@@ -12,15 +12,22 @@ from __future__ import annotations
 
 import unittest
 
-import frappe
+from clickhouse_sync.tests._fakes import ensure_frappe_importable
+
+ensure_frappe_importable()
+
+import frappe  # noqa: E402
 
 try:
     from frappe.tests.utils import FrappeTestCase
+
+    IN_BENCH = True
 except Exception:  # pragma: no cover - allows import outside a bench
     FrappeTestCase = unittest.TestCase  # type: ignore[assignment,misc]
+    IN_BENCH = False
 
-from clickhouse_sync.clickhouse import connection as ch_connection
-from clickhouse_sync.clickhouse import sync_engine
+from clickhouse_sync.clickhouse import connection as ch_connection  # noqa: E402
+from clickhouse_sync.clickhouse import sync_engine  # noqa: E402
 
 
 def _clickhouse_available() -> bool:
@@ -43,6 +50,7 @@ class TestSyncEngineHelpers(FrappeTestCase):
     def test_batch_size_passthrough(self) -> None:
         self.assertEqual(sync_engine._clamp_batch_size(25000), 25000)
 
+    @unittest.skipUnless(IN_BENCH, "needs a Frappe site with Redis (bench run-tests)")
     def test_cancel_flag_roundtrip(self) -> None:
         cfg = "unit-test-cancel"
         self.assertFalse(sync_engine._is_cancelled(cfg))
