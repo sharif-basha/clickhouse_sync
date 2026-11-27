@@ -1,0 +1,35 @@
+{
+ "allow_roles": [
+  {
+   "role": "System Manager"
+  }
+ ],
+ "creation": "2026-11-27 12:00:00.000000",
+ "docstatus": 0,
+ "doctype": "Module Onboarding",
+ "documentation_url": "https://github.com/sharif-basha/clickhouse_sync#getting-started",
+ "idx": 0,
+ "is_complete": 0,
+ "modified": "2026-11-27 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ClickHouse Warehouse",
+ "name": "ClickHouse Sync",
+ "owner": "Administrator",
+ "steps": [
+  {
+   "step": "Connect to ClickHouse"
+  },
+  {
+   "step": "Add a DocType to Sync"
+  },
+  {
+   "step": "Run Your First Sync"
+  },
+  {
+   "step": "Set Up Alerts"
+  }
+ ],
+ "subtitle": "Connect, choose a DocType, run a sync and turn on alerts.",
+ "success_message": "ClickHouse Sync is set up!",
+ "title": "Let's set up ClickHouse Sync"
+}

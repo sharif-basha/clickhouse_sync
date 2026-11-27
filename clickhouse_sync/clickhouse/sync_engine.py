@@ -61,6 +61,7 @@ from clickhouse_sync.clickhouse.schema import (
     TableSchema,
     build_table_schema,
     ensure_table,
+    ensure_view,
     get_child_doctypes,
     insert_columns,
     is_creation_partitioned,
@@ -864,7 +865,8 @@ def _run_once(ctx: SyncContext, result: SyncResult) -> None:
     # 1. Table + schema reconciliation.
     live.update(force=True, phase="checking schema")
     created = ensure_table(client, ctx.schema, database, auto_create=ctx.auto_create)
-    reconcile_schema(client, ctx.schema, database, auto_update=ctx.auto_update)
+    schema_diff = reconcile_schema(client, ctx.schema, database, auto_update=ctx.auto_update)
+    ensure_view(client, ctx.schema, database, refresh=created or schema_diff.has_changes)
     partition_note = ""
     if ctx.partition_by_creation and not created and not is_creation_partitioned(
         client, database, ctx.table_name
@@ -1161,8 +1163,9 @@ def _sync_one_child(
         is_child=True,
         partition_by_creation=ctx.partition_by_creation,
     )
-    ensure_table(client, child_schema, database, auto_create=ctx.auto_create)
-    reconcile_schema(client, child_schema, database, auto_update=ctx.auto_update)
+    child_created = ensure_table(client, child_schema, database, auto_create=ctx.auto_create)
+    child_diff = reconcile_schema(client, child_schema, database, auto_update=ctx.auto_update)
+    ensure_view(client, child_schema, database, refresh=child_created or child_diff.has_changes)
     column_defs = insert_columns(client, child_schema, database)
 
     managed = {SYNC_TIMESTAMP_COLUMN, SOFT_DELETE_COLUMN}

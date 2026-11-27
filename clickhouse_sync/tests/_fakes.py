@@ -36,7 +36,7 @@ LOG_TABLE_COLUMNS = [
 ]
 CONFIG_TABLE_COLUMNS = [
     "name", "source_doctype", "enabled", "scheduler_enabled", "sync_mode",
-    "delete_strategy", "priority", "last_sync_timestamp",
+    "delete_strategy", "priority", "last_sync_timestamp", "sync_interval_minutes",
 ]
 
 
@@ -209,9 +209,15 @@ class FakeDB:
         return cur.fetchone()[0]
 
     def set_value(self, doctype: str, name: str, field: str, value: Any, **kwargs: Any) -> None:
+        table = f"tab{doctype}"
+        if field != "last_sync_timestamp":
+            if self.has_table(table):
+                self.conn.execute(
+                    f"UPDATE `{table}` SET `{field}` = ? WHERE name = ?", (self._to_db(value), name)
+                )
+            return
         self.cursors[name] = value
         self.cursor_history.append(value)
-        table = f"tab{doctype}"
         if field == "last_sync_timestamp" and self.has_table(table):
             self.conn.execute(
                 f"UPDATE `{table}` SET last_sync_timestamp = ? WHERE name = ?",
@@ -290,6 +296,7 @@ class FakeClickHouse:
         self.columns: dict[str, dict[str, str]] = {}
         self.queries: list[tuple[str, dict[str, Any]]] = []
         self.partition_keys: dict[str, str] = {}
+        self.views: dict[str, str] = {}
         self.commands: list[str] = []
         self.command_calls: list[tuple[str, dict[str, Any]]] = []
         self.insert_log: list[tuple[str, int]] = []
@@ -329,6 +336,10 @@ class FakeClickHouse:
                 m.group(1): m.group(2).strip().rstrip(",").strip()
                 for m in re.finditer(r"^\s*`([^`]+)` (.+?),?\s*$", body, re.MULTILINE)
             }
+            return
+        match = re.search(r"CREATE OR REPLACE VIEW `[^`]+`\.`([^`]+)` AS (.+)$", sql)
+        if match:
+            self.views[match.group(1)] = match.group(2)
             return
         match = re.search(
             r"ALTER TABLE `[^`]+`\.`([^`]+)` (?:ADD COLUMN IF NOT EXISTS|MODIFY COLUMN) `([^`]+)` (.+)$", sql
@@ -380,7 +391,9 @@ class FakeClickHouse:
             table = (parameters or {}).get("tbl")
             if table is None:
                 return types.SimpleNamespace(result_rows=[[1]])
-            return types.SimpleNamespace(result_rows=[[1 if table in self.tables else 0]])
+            return types.SimpleNamespace(
+                result_rows=[[1 if table in self.tables or table in self.views else 0]]
+            )
         if "FROM system.parts" in sql:
             return types.SimpleNamespace(
                 result_rows=[[t, len(rows), 1000 * len(rows), 1] for t, rows in self.tables.items()]
@@ -522,6 +535,11 @@ class FakeFrappe:
         if self.deny_roles:
             raise PermissionError("Not permitted")
 
+    def has_permission(self, *args: Any, **kwargs: Any) -> bool:
+        return not self.deny_roles
+
+    PermissionError = PermissionError
+
     def throw(self, message: str, *args: Any, **kwargs: Any) -> None:
         raise ValueError(message)
 
@@ -630,6 +648,7 @@ class EngineHarness:
             scheduler_enabled=values.get("scheduler_enabled", 1), sync_mode=values["sync_mode"],
             delete_strategy=values["delete_strategy"], priority=values.get("priority", 0),
             last_sync_timestamp=self.db.cursors.get(values["name"]),
+            sync_interval_minutes=values.get("sync_interval_minutes", 15),
         )
 
     def add_child_table(self, child_doctype: str = "Doc Item") -> str:

@@ -41,9 +41,9 @@ frappe.ui.form.on("ClickHouse Settings", {
 					indicator: res.ok ? "green" : "orange",
 				});
 			});
-		}, __("Telegram"));
+		}, __("Alerts"));
 
-		frm.add_custom_button(__("Send Test Telegram Alert"), () => {
+		frm.add_custom_button(__("Send Test Alert"), () => {
 			frm.call({
 				method: "clickhouse_sync.clickhouse.alerts.send_test_alert",
 				freeze: true, freeze_message: __("Sending test alert…"),
@@ -55,6 +55,6 @@ frappe.ui.form.on("ClickHouse Settings", {
 					indicator: res.ok ? "green" : "orange",
 				});
 			});
-		}, __("Telegram"));
+		}, __("Alerts"));
 	},
 });

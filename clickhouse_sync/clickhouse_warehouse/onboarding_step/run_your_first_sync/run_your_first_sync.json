@@ -1,0 +1,23 @@
+{
+ "creation": "2026-11-27 12:00:00.000000",
+ "docstatus": 0,
+ "doctype": "Onboarding Step",
+ "idx": 0,
+ "is_complete": 0,
+ "is_single": 0,
+ "is_skipped": 0,
+ "modified": "2026-11-27 12:00:00.000000",
+ "modified_by": "Administrator",
+ "name": "Run Your First Sync",
+ "owner": "Administrator",
+ "show_form_tour": 0,
+ "show_full_form": 0,
+ "title": "Run Your First Sync",
+ "validate_action": 0,
+ "action": "Go to Page",
+ "path": "clickhouse-sync-dashboard",
+ "action_label": "Open the Sync Dashboard",
+ "callback_title": "Run your first sync",
+ "callback_message": "Press Incremental on your DocType's row. The first run copies every record; after that only changes are copied.",
+ "description": "# Run your first sync\n\nOn the Sync Dashboard, press **Incremental** on the DocType's row. When it shows *Completed* and *Difference* is 0, the copy matches."
+}

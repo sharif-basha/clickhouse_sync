@@ -477,6 +477,50 @@ def _comparable(clickhouse_type: str) -> str:
     return strip_timezone(_base_type(clickhouse_type))
 
 
+def view_name_for(table_name: str) -> str:
+    """Name of the reporting view for a table: ``tab_sales_invoice`` -> ``v_sales_invoice``."""
+    return "v_" + (table_name[4:] if table_name.startswith("tab_") else table_name)
+
+
+def ensure_view(
+    client: "Client",
+    schema: TableSchema,
+    database: str,
+    *,
+    refresh: bool = False,
+) -> bool:
+    """Keep a ready-to-query view next to the table.
+
+    ``v_<doctype>`` selects the table with ``FINAL`` (one row per record, its
+    latest version) and, when the table has the soft-delete flag, only rows
+    that are not deleted. Reports can use it without remembering either rule.
+
+    ClickHouse fixes a view's column list when it is created, so it is
+    recreated when the table was just created or its columns changed
+    (``refresh``), and created when missing. A failure (for example a
+    ClickHouse user without CREATE VIEW) is logged and never fails a sync.
+
+    Returns:
+        ``True`` if the view was created or replaced.
+    """
+    view = view_name_for(schema.table_name)
+    logger = frappe.logger("clickhouse_sync")
+    try:
+        if not refresh and table_exists(client, database, view):
+            return False
+        live = _live_columns(client, database, schema.table_name)
+        where = f" WHERE `{SOFT_DELETE_COLUMN}` = 0" if SOFT_DELETE_COLUMN in live else ""
+        client.command(
+            f"CREATE OR REPLACE VIEW `{database}`.`{view}` AS "
+            f"SELECT * FROM `{database}`.`{schema.table_name}` FINAL{where}"
+        )
+    except Exception as exc:  # noqa: BLE001 - a convenience view must never fail a sync
+        logger.warning(f"Could not create view {view}: {exc}")
+        return False
+    logger.info(f"Created view {view}")
+    return True
+
+
 def _base_type(clickhouse_type: str) -> str:
     """Strip a ``Nullable(...)`` wrapper to get the underlying base type."""
     t = clickhouse_type.strip()

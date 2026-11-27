@@ -1,0 +1,14 @@
+{
+ "creation": "2026-11-27 12:00:00.000000",
+ "doctype": "Number Card",
+ "is_public": 1,
+ "is_standard": 1,
+ "label": "Oldest Sync",
+ "method": "clickhouse_sync.api.api.data_freshness_card",
+ "module": "ClickHouse Warehouse",
+ "modified": "2026-11-27 12:00:00.000000",
+ "name": "Oldest Sync",
+ "owner": "Administrator",
+ "show_percentage_stats": 0,
+ "type": "Custom"
+}
