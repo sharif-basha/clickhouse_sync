@@ -18,7 +18,7 @@ and Telegram can alert you to failures.
 
 **Version:** 1.8.0 · **Frappe:** v15 ·
 **ClickHouse:** any version with the HTTP interface (tested against 26.6) ·
-**License:** MIT
+**License:** [MIT](license.txt)
 
 ---
 
@@ -68,6 +68,7 @@ copy, which is a few minutes behind the live data.
 - [Settings reference](#settings-reference)
 - [Security](#security)
 - [Known limitations](#known-limitations)
+- [License and trademarks](#license-and-trademarks)
 
 **For developers**
 
@@ -464,7 +465,7 @@ first so no queued delete is left behind.
 | Max Threads, Max Insert Block Size | Passed to ClickHouse as query settings. |
 | Staleness Alert Hours | See Telegram alerts. |
 | Log Retention Days | Sync Logs older than this are deleted daily (default 90; 0 keeps all). |
-| Alert Mode, Alert On, Telegram Bot Token, Telegram Chat ID, Alert Email Recipients | See [Telegram and email alerts](#telegram-alerts). |
+| Alert Mode, Alert On, Telegram Bot Token, Telegram Chat ID, Alert Email Recipients, Include Error Details in Alerts | See [Telegram and email alerts](#telegram-alerts). |
 
 ### 2. ClickHouse Sync Configuration (one per DocType)
 
@@ -514,7 +515,12 @@ on its Source DocType.
   list. The sync itself does not apply Frappe user permissions, so anyone who
   can query the ClickHouse database can read every synced DocType. Give BI
   tools a read-only ClickHouse user limited to the warehouse database.
-- Use **Secure** (TLS) when ClickHouse is on another host.
+- Use **Secure** (TLS) when ClickHouse is on another host. Saving ClickHouse
+  Settings warns when the host isn't this machine and Secure is off.
+- Alerts leave out error text by default, because it can quote record names
+  or field values and Telegram and email are outside the site. They name the
+  DocType and the Sync Log to open instead. Turn on **Include Error Details
+  in Alerts** to send the text.
 
 ## Known limitations
 
@@ -546,6 +552,16 @@ on its Source DocType.
   dead-letter list of individual records yet.
 - Very large initial loads in Incremental mode read in `modified` order,
   which is slower than a Full-mode pass, but they can resume.
+
+## License and trademarks
+
+Released under the [MIT License](license.txt). Copyright (c) 2026 RySS /
+Common Ground Initiative and contributors.
+
+ClickHouse is a trademark of ClickHouse, Inc. This project is not affiliated
+with or endorsed by ClickHouse, Inc. Frappe, ERPNext, Telegram and Superset
+are trademarks of their respective owners and are named only to describe
+compatibility.
 
 ## For developers
 
@@ -624,6 +640,17 @@ ClickHouse client and is reused by `ai_insights`.
 
 Upgrading: follow [Install and update](#install-and-update) and run
 `bench --site <site> migrate`. `bench version` now shows 1.8.0.
+
+#### Compliance
+
+- Added the MIT `license.txt` that every file header refers to, and declared
+  the license in `pyproject.toml`.
+- Fixed documentation links that pointed to a GitHub account and domain
+  this project doesn't own.
+- Alerts no longer include error text unless **Include Error Details in
+  Alerts** is on.
+- ClickHouse Settings warns when a remote server is used without Secure.
+- README: license and trademark notice.
 
 #### Enhancements
 

@@ -8,6 +8,8 @@ name = "clickhouse_sync"
 dynamic = ["version"]
 description = "Sync ERPNext DocTypes to ClickHouse with retry, batching, Telegram alerts and analytics."
 requires-python = ">=3.10"
+license = { file = "license.txt" }
+classifiers = ["License :: OSI Approved :: MIT License"]
 dependencies = ["clickhouse-connect>=0.7.0", "requests>=2.28.0"]
 
 [tool.flit.module]

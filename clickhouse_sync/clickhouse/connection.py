@@ -100,6 +100,23 @@ class ClickHouseConnectionParams:
         return settings
 
 
+def is_local_host(host: str | None) -> bool:
+    """``True`` when ``host`` is this machine (loopback), where plain HTTP is safe.
+
+    Any other host, including private-network addresses, carries the synced
+    data over the network and should use TLS (*Secure*).
+    """
+    import ipaddress
+
+    name = (host or "").strip().lower().strip("[]")
+    if name in ("localhost", "localhost.localdomain") or name.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
 def get_connection_params() -> ClickHouseConnectionParams:
     """Load and validate connection parameters from ClickHouse Settings.
 
