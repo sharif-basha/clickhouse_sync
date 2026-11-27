@@ -74,11 +74,12 @@ class ClickHouseSettings(Document):
         """
         frappe.only_for("System Manager")
         health = ch_connection.health_check()
+        checked = frappe.utils.now_datetime().strftime("%Y-%m-%d %H:%M")
         status = (
             f"OK - ClickHouse {health['server_version']} "
-            f"({health['latency_ms']} ms)"
+            f"({health['latency_ms']} ms), checked {checked}"
             if health["ok"]
-            else f"ERROR - {health['message']}"
+            else f"ERROR - {health['message']} (checked {checked})"
         )
         self.db_set("connection_status", status, update_modified=False)
         return health
