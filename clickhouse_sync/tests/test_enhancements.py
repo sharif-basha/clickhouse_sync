@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 # For license information, please see license.txt
 """Tests for the 1.8.0 enhancements: next-run times, pause/resume, the data
 freshness card, reporting views, email alerts and the onboarding checklist."""

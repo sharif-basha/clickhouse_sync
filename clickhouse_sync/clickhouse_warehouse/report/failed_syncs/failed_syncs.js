@@ -1,4 +1,4 @@
-// Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+// Copyright (c) 2026, Sharif Basha and contributors
 frappe.query_reports["Failed Syncs"] = {
 	filters: [
 		{

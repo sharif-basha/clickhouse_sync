@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 # For license information, please see license.txt
 """The workspace only shows what its ``content`` places, and each placed block
 must name a shortcut, card, number card or chart that exists. A broken name

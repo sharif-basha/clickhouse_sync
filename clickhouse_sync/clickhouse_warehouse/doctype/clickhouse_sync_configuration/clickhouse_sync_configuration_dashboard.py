@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 # For license information, please see license.txt
 """Form dashboard for ``ClickHouse Sync Configuration``.
 

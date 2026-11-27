@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 # For license information, please see license.txt
 """Frappe app hooks for clickhouse_sync.
 
@@ -12,9 +12,9 @@ from clickhouse_sync import __version__
 
 app_name = "clickhouse_sync"
 app_title = "ClickHouse Sync"
-app_publisher = "RySS / Common Ground Initiative"
+app_publisher = "Sharif Basha"
 app_description = "Automatic, high-throughput synchronisation of Frappe (MariaDB) data into ClickHouse for high-performance reporting."
-app_email = "data@ryss.example.org"
+app_email = "sharifbasha.achukatla@gmail.com"
 app_license = "MIT"
 app_version = __version__
 required_apps = ["frappe"]

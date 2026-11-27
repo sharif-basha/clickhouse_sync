@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 """Rename the module 'ClickHouse Sync' -> 'ClickHouse Warehouse'.
 
 The old module name slugified to ``clickhouse-sync``, which shadowed the
