@@ -7,9 +7,17 @@
   {
    "chart_name": "Sync Status Breakdown",
    "label": "Sync Status Breakdown"
+  },
+  {
+   "chart_name": "Failures by DocType",
+   "label": "Failures by DocType"
+  },
+  {
+   "chart_name": "Average Sync Duration",
+   "label": "Average Sync Duration"
   }
  ],
- "content": "[{\"id\":\"header_intro\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">ClickHouse Sync</span>\",\"col\":12}},{\"id\":\"para_intro\",\"type\":\"paragraph\",\"data\":{\"text\":\"Automatic, high-throughput replication of Frappe data into ClickHouse for reporting.\",\"col\":12}},{\"id\":\"sb_cards\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"card_running\",\"type\":\"number_card\",\"data\":{\"number_card_name\":\"Running Syncs\",\"col\":3}},{\"id\":\"card_failed\",\"type\":\"number_card\",\"data\":{\"number_card_name\":\"Failed Syncs Today\",\"col\":3}},{\"id\":\"card_rows_today\",\"type\":\"number_card\",\"data\":{\"number_card_name\":\"Rows Today\",\"col\":3}},{\"id\":\"card_rows_total\",\"type\":\"number_card\",\"data\":{\"number_card_name\":\"Rows Total\",\"col\":3}},{\"id\":\"card_avg\",\"type\":\"number_card\",\"data\":{\"number_card_name\":\"Average Duration\",\"col\":3}},{\"id\":\"chart_rows\",\"type\":\"chart\",\"data\":{\"chart_name\":\"Rows Synced Per Day\",\"col\":8}},{\"id\":\"chart_status\",\"type\":\"chart\",\"data\":{\"chart_name\":\"Sync Status Breakdown\",\"col\":4}}]",
+ "content": "[{\"id\": \"chs0000001\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Sync health</b></span>\", \"col\": 12}}, {\"id\": \"chs0000002\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Running Syncs\", \"col\": 4}}, {\"id\": \"chs0000003\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Failed Syncs Today\", \"col\": 4}}, {\"id\": \"chs0000004\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Failed Syncs This Week\", \"col\": 4}}, {\"id\": \"chs0000005\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Enabled DocTypes\", \"col\": 4}}, {\"id\": \"chs0000006\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Rows Today\", \"col\": 4}}, {\"id\": \"chs0000007\", \"type\": \"number_card\", \"data\": {\"number_card_name\": \"Average Duration\", \"col\": 4}}, {\"id\": \"chs0000008\", \"type\": \"spacer\", \"data\": {\"col\": 12}}, {\"id\": \"chs0000009\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Your Shortcuts</b></span>\", \"col\": 12}}, {\"id\": \"chs0000010\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Sync Dashboard\", \"col\": 4}}, {\"id\": \"chs0000011\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Add a DocType\", \"col\": 4}}, {\"id\": \"chs0000012\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Sync Configurations\", \"col\": 4}}, {\"id\": \"chs0000013\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Failed Syncs\", \"col\": 4}}, {\"id\": \"chs0000014\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Sync Logs\", \"col\": 4}}, {\"id\": \"chs0000015\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"ClickHouse Settings\", \"col\": 4}}, {\"id\": \"chs0000016\", \"type\": \"spacer\", \"data\": {\"col\": 12}}, {\"id\": \"chs0000017\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Trends (last 30 days)</b></span>\", \"col\": 12}}, {\"id\": \"chs0000018\", \"type\": \"chart\", \"data\": {\"chart_name\": \"Rows Synced Per Day\", \"col\": 6}}, {\"id\": \"chs0000019\", \"type\": \"chart\", \"data\": {\"chart_name\": \"Sync Status Breakdown\", \"col\": 6}}, {\"id\": \"chs0000020\", \"type\": \"chart\", \"data\": {\"chart_name\": \"Failures by DocType\", \"col\": 6}}, {\"id\": \"chs0000021\", \"type\": \"chart\", \"data\": {\"chart_name\": \"Average Sync Duration\", \"col\": 6}}, {\"id\": \"chs0000022\", \"type\": \"spacer\", \"data\": {\"col\": 12}}, {\"id\": \"chs0000023\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Setup, Monitoring & Reports</b></span>\", \"col\": 12}}, {\"id\": \"chs0000024\", \"type\": \"card\", \"data\": {\"card_name\": \"Setup\", \"col\": 4}}, {\"id\": \"chs0000025\", \"type\": \"card\", \"data\": {\"card_name\": \"Monitoring\", \"col\": 4}}, {\"id\": \"chs0000026\", \"type\": \"card\", \"data\": {\"card_name\": \"Reports\", \"col\": 4}}]",
  "creation": "2026-01-01 00:00:00.000000",
  "custom_blocks": [],
  "docstatus": 0,
@@ -24,33 +32,58 @@
   {
    "hidden": 0,
    "is_query_report": 0,
-   "label": "Configuration",
-   "link_type": "DocType",
+   "label": "Setup",
+   "link_count": 2,
    "onboard": 0,
    "type": "Card Break"
   },
   {
+   "dependencies": "",
    "hidden": 0,
    "is_query_report": 0,
    "label": "ClickHouse Settings",
+   "link_count": 0,
    "link_to": "ClickHouse Settings",
    "link_type": "DocType",
-   "onboard": 1,
+   "onboard": 0,
    "type": "Link"
   },
   {
+   "dependencies": "",
    "hidden": 0,
    "is_query_report": 0,
-   "label": "ClickHouse Sync Configuration",
+   "label": "Sync Configuration",
+   "link_count": 0,
    "link_to": "ClickHouse Sync Configuration",
    "link_type": "DocType",
-   "onboard": 1,
+   "onboard": 0,
    "type": "Link"
   },
   {
    "hidden": 0,
    "is_query_report": 0,
-   "label": "ClickHouse Sync Log",
+   "label": "Monitoring",
+   "link_count": 2,
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Sync Dashboard",
+   "link_count": 0,
+   "link_to": "clickhouse-sync-dashboard",
+   "link_type": "Page",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Sync Log",
+   "link_count": 0,
    "link_to": "ClickHouse Sync Log",
    "link_type": "DocType",
    "onboard": 0,
@@ -60,48 +93,56 @@
    "hidden": 0,
    "is_query_report": 0,
    "label": "Reports",
-   "link_type": "DocType",
+   "link_count": 4,
    "onboard": 0,
    "type": "Card Break"
   },
   {
+   "dependencies": "",
    "hidden": 0,
    "is_query_report": 1,
    "label": "Sync Summary",
+   "link_count": 0,
    "link_to": "Sync Summary",
    "link_type": "Report",
    "onboard": 0,
    "type": "Link"
   },
   {
+   "dependencies": "",
    "hidden": 0,
    "is_query_report": 1,
    "label": "Failed Syncs",
+   "link_count": 0,
    "link_to": "Failed Syncs",
    "link_type": "Report",
    "onboard": 0,
    "type": "Link"
   },
   {
+   "dependencies": "",
    "hidden": 0,
    "is_query_report": 1,
-   "label": "Largest Tables",
-   "link_to": "Largest Tables",
+   "label": "Slowest Syncs",
+   "link_count": 0,
+   "link_to": "Slowest Syncs",
    "link_type": "Report",
    "onboard": 0,
    "type": "Link"
   },
   {
+   "dependencies": "",
    "hidden": 0,
    "is_query_report": 1,
-   "label": "Slowest Syncs",
-   "link_to": "Slowest Syncs",
+   "label": "Largest Tables",
+   "link_count": 0,
+   "link_to": "Largest Tables",
    "link_type": "Report",
    "onboard": 0,
    "type": "Link"
   }
  ],
- "modified": "2026-01-01 00:00:00.000000",
+ "modified": "2026-11-27 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "ClickHouse Warehouse",
  "name": "ClickHouse Warehouse",
@@ -115,12 +156,16 @@
    "number_card_name": "Failed Syncs Today"
   },
   {
-   "label": "Rows Today",
-   "number_card_name": "Rows Today"
+   "label": "Failed Syncs This Week",
+   "number_card_name": "Failed Syncs This Week"
   },
   {
-   "label": "Rows Total",
-   "number_card_name": "Rows Total"
+   "label": "Enabled DocTypes",
+   "number_card_name": "Enabled DocTypes"
+  },
+  {
+   "label": "Rows Today",
+   "number_card_name": "Rows Today"
   },
   {
    "label": "Average Duration",
@@ -135,30 +180,48 @@
  "sequence_id": 1.0,
  "shortcuts": [
   {
-   "color": "Green",
+   "color": "Blue",
    "doc_view": "",
-   "label": "Dashboard",
+   "label": "Sync Dashboard",
    "link_to": "clickhouse-sync-dashboard",
    "type": "Page"
   },
   {
-   "color": "Green",
-   "doc_view": "",
-   "label": "Sync Configurations",
+   "color": "Blue",
+   "doc_view": "New",
+   "label": "Add a DocType",
    "link_to": "ClickHouse Sync Configuration",
    "type": "DocType"
   },
   {
+   "color": "Green",
+   "doc_view": "List",
+   "format": "{} Enabled",
+   "label": "Sync Configurations",
+   "link_to": "ClickHouse Sync Configuration",
+   "stats_filter": "{\"enabled\": 1}",
+   "type": "DocType"
+  },
+  {
+   "color": "Red",
+   "doc_view": "List",
+   "format": "{} Failed",
+   "label": "Failed Syncs",
+   "link_to": "ClickHouse Sync Log",
+   "stats_filter": "{\"status\": \"Failed\"}",
+   "type": "DocType"
+  },
+  {
    "color": "Grey",
-   "doc_view": "",
+   "doc_view": "List",
    "label": "Sync Logs",
    "link_to": "ClickHouse Sync Log",
    "type": "DocType"
   },
   {
-   "color": "Blue",
+   "color": "Grey",
    "doc_view": "",
-   "label": "Settings",
+   "label": "ClickHouse Settings",
    "link_to": "ClickHouse Settings",
    "type": "DocType"
   }
