@@ -1,0 +1,23 @@
+{
+ "chart_name": "Failures by DocType",
+ "chart_type": "Group By",
+ "creation": "2026-11-27 00:00:00.000000",
+ "doctype": "Dashboard Chart",
+ "document_type": "ClickHouse Sync Log",
+ "dynamic_filters_json": "[]",
+ "filters_json": "[[\"ClickHouse Sync Log\",\"status\",\"=\",\"Failed\",false],[\"ClickHouse Sync Log\",\"creation\",\"Timespan\",\"last month\",false]]",
+ "group_by_based_on": "configuration",
+ "group_by_type": "Count",
+ "is_public": 1,
+ "is_standard": 1,
+ "module": "ClickHouse Warehouse",
+ "modified": "2026-11-27 00:00:00.000000",
+ "name": "Failures by DocType",
+ "number_of_groups": 10,
+ "owner": "Administrator",
+ "timeseries": 0,
+ "timespan": "Last Month",
+ "type": "Bar",
+ "use_report_chart": 0,
+ "color": "#E24C4C"
+}

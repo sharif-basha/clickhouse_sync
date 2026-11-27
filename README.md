@@ -55,6 +55,7 @@ copy, which is a few minutes behind the live data.
 - [What it does](#what-it-does)
 - [How a sync works](#how-a-sync-works) (with diagrams)
 - [Choosing settings](#choosing-settings): which options to pick for each DocType
+- [Workspace](#workspace): the app's home page in Desk
 - [Monitoring dashboard](#monitoring-dashboard)
 - [Telegram alerts](#telegram-alerts)
 - [Querying the warehouse](#querying-the-warehouse)
@@ -242,6 +243,18 @@ Start with the defaults; change a setting only when one of these applies.
 | The DocType has personal or sensitive fields | List them in **Excluded Fields** (passwords and secrets are always excluded) |
 
 Every field is described in the [Settings reference](#settings-reference).
+
+## Workspace
+
+Click **ClickHouse Warehouse** in the Desk sidebar for the app's home page,
+laid out like Frappe's own HR and Stock workspaces:
+
+| Section | What's there |
+| --- | --- |
+| Sync health | Number cards: syncs running now, failed today, failed this week, enabled DocTypes, records copied today, average run time |
+| Your Shortcuts | Sync Dashboard, Add a DocType, Sync Configurations (with the number enabled), Failed Syncs (with the number failed), Sync Logs, ClickHouse Settings |
+| Trends (last 30 days) | Records copied per day, runs by outcome, failures by DocType, average run time per day |
+| Setup, Monitoring & Reports | Links to settings, configurations, the dashboard, the logs and the four reports |
 
 ## Monitoring dashboard
 
@@ -590,6 +603,15 @@ follow [Install and update](#install-and-update); `bench migrate` adds four
 fields (Log Retention Days, Sync Interval, Cursor Safety Lag, Partition By
 Creation Month). Nothing changes for existing ClickHouse tables until you opt
 in.
+
+#### Workspace
+
+- The ClickHouse Warehouse workspace is laid out like Frappe's HR and Stock
+  workspaces: health cards, shortcuts with live counts, four trend charts and
+  link cards. Its shortcuts and link cards were defined before but never
+  placed on the page, so they didn't show. New: *Failed Syncs This Week* and
+  *Enabled DocTypes* cards, *Failures by DocType* and *Average Sync Duration*
+  charts. A test checks every placed block refers to something that exists.
 
 #### Desk fix
 
