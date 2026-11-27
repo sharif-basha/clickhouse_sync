@@ -435,6 +435,7 @@ first so no queued delete is left behind.
 | --- | --- |
 | Host, Port, Database, Username, Password | Connection. The password is stored encrypted. |
 | Secure | Use HTTPS. Turn this on for any server not on the same machine or private network. |
+| Test Connection (button) / Connection Status | Save the settings, then press **Test Connection**: it connects with the saved settings and shows the result. *Connection Status* keeps the last result and when it was checked, for example `OK - ClickHouse 24.8 (12 ms), checked 2026-11-27 10:15`. The Sync Dashboard also shows a connected / unreachable badge on every refresh. |
 | Compression | Compress inserts (recommended). |
 | Connection Timeout, Send/Receive Timeout | Seconds. |
 | Max Threads, Max Insert Block Size | Passed to ClickHouse as query settings. |
@@ -603,6 +604,13 @@ follow [Install and update](#install-and-update); `bench migrate` adds four
 fields (Log Retention Days, Sync Interval, Cursor Safety Lag, Partition By
 Creation Month). Nothing changes for existing ClickHouse tables until you opt
 in.
+
+#### Test Connection button
+
+- ClickHouse Settings now has a **Test Connection** button. It checks the
+  saved settings, shows the server version and response time (or the error),
+  and records the result with the time of the check in *Connection Status*.
+  The server-side check existed, but the form had no button to run it.
 
 #### Workspace
 
