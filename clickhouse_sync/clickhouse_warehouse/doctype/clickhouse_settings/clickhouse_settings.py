@@ -37,6 +37,26 @@ class ClickHouseSettings(Document):
         if not self.default_engine:
             self.default_engine = "ReplacingMergeTree"
         self._require_password_for_new_endpoint()
+        self._warn_if_unencrypted()
+
+    def _warn_if_unencrypted(self) -> None:
+        """Warn when synced data would cross the network without TLS.
+
+        A warning, not an error, so existing setups keep working; the sync
+        copies business and personal data, which should be encrypted in
+        transit whenever ClickHouse is on another machine.
+        """
+        if self.secure or not self.host or ch_connection.is_local_host(self.host):
+            return
+        frappe.msgprint(
+            _(
+                "ClickHouse at {0} is on another machine but <b>Secure</b> is off, so synced data, "
+                "including any personal data, travels unencrypted. Turn on Secure (HTTPS, usually "
+                "port 8443) unless the connection is already protected, for example by a VPN."
+            ).format(frappe.bold(self.host)),
+            title=_("Connection is not encrypted"),
+            indicator="orange",
+        )
 
     def _require_password_for_new_endpoint(self) -> None:
         """Changing where credentials go requires typing the password again.

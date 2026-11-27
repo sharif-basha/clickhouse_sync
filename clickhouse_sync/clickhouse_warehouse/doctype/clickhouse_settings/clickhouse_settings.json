@@ -31,7 +31,8 @@
   "alert_on",
   "telegram_bot_token",
   "telegram_chat_id",
-  "alert_email_recipients"
+  "alert_email_recipients",
+  "alert_include_details"
  ],
  "fields": [
   {
@@ -198,6 +199,13 @@
    "description": "Email addresses for sync alerts, separated by commas or new lines. Uses the site's outgoing email account. Leave empty to send alerts only to Telegram."
   },
   {
+   "fieldname": "alert_include_details",
+   "fieldtype": "Check",
+   "label": "Include Error Details in Alerts",
+   "default": "0",
+   "description": "Off (recommended): alerts say which DocType failed and which Sync Log to open, without the error text. Error messages can quote record names or field values, and Telegram and email are outside this site."
+  },
+  {
    "fieldname": "alert_mode",
    "fieldtype": "Select",
    "label": "Alert Mode",
@@ -209,7 +217,7 @@
  "index_web_pages_for_search": 0,
  "issingle": 1,
  "links": [],
- "modified": "2026-11-27 12:00:00.000000",
+ "modified": "2026-11-27 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "ClickHouse Warehouse",
  "name": "ClickHouse Settings",

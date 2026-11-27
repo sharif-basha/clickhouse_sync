@@ -133,6 +133,14 @@ def _deliver(channels, message: str, subject: str) -> bool:
     return delivered
 
 
+def _include_details() -> bool:
+    """Whether alerts may carry error text (Include Error Details in Alerts)."""
+    try:
+        return bool(int(_settings().get("alert_include_details") or 0))
+    except Exception:  # noqa: BLE001 - unknown: keep details out
+        return False
+
+
 def _should_alert(status: str) -> bool:
     mode = (_settings().get("alert_on") or "Failures").strip()
     if mode == "Never":
@@ -155,9 +163,15 @@ def _format_message(config_name: str, trigger: str, result: "SyncResult") -> str
         lines.append(f"Rows failed: {result.rows_failed:,}")
     # ``duration`` is a property on SyncResult (seconds as a float).
     lines.append(f"Duration: {float(result.duration or 0):.1f}s")
-    if result.status not in ("Completed", "Success") and result.message:
-        msg = frappe.utils.escape_html(str(result.message)[:300])
-        lines.append(f"\n<code>{msg}</code>")
+    if result.status not in ("Completed", "Success"):
+        # The error text can quote record names or field values, and these
+        # channels are outside the site, so it is only included when the
+        # operator opts in. The Sync Log always has the full details.
+        if _include_details() and result.message:
+            msg = frappe.utils.escape_html(str(result.message)[:300])
+            lines.append(f"\n<code>{msg}</code>")
+        elif result.log_name:
+            lines.append(f"Details: Sync Log {frappe.utils.escape_html(result.log_name)}")
     site = frappe.local.site or ""
     if site:
         lines.append(f"\n<i>{site}</i>")
