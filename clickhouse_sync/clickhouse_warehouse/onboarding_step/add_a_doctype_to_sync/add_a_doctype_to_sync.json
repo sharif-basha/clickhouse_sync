@@ -1,0 +1,21 @@
+{
+ "creation": "2026-11-27 12:00:00.000000",
+ "docstatus": 0,
+ "doctype": "Onboarding Step",
+ "idx": 0,
+ "is_complete": 0,
+ "is_single": 0,
+ "is_skipped": 0,
+ "modified": "2026-11-27 12:00:00.000000",
+ "modified_by": "Administrator",
+ "name": "Add a DocType to Sync",
+ "owner": "Administrator",
+ "show_form_tour": 0,
+ "show_full_form": 1,
+ "title": "Add a DocType to Sync",
+ "validate_action": 0,
+ "action": "Create Entry",
+ "reference_document": "ClickHouse Sync Configuration",
+ "action_label": "Add a DocType",
+ "description": "# Choose what to copy\n\nCreate a **ClickHouse Sync Configuration** for a DocType, for example *Sales Invoice*. Keep **Sync Mode** on *Incremental* and pick a **Delete Strategy**; the README's *Choosing settings* section explains the options."
+}

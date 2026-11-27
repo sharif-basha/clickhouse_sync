@@ -80,7 +80,7 @@ def _configs() -> list[dict[str, Any]]:
     return frappe.db.sql(
         f"""
         SELECT name, source_doctype, enabled, scheduler_enabled, sync_mode,
-               delete_strategy, priority, last_sync_timestamp
+               delete_strategy, priority, last_sync_timestamp, sync_interval_minutes
         FROM `tab{CONFIG_DOCTYPE}`
         ORDER BY priority ASC, name ASC
         """,
@@ -505,9 +505,12 @@ def overview(days: int = 7) -> dict[str, Any]:
     now = now_datetime()
     since = (now - timedelta(days=window)).replace(hour=0, minute=0, second=0, microsecond=0)
 
+    from clickhouse_sync.tasks import _last_started, next_run_at
+
     configs = _configs()
     warehouse = _Warehouse()
     history = _per_config_history()
+    last_started = _last_started()
     live_runs = _live_runs(configs)
     live_by_config = {r["configuration"]: r for r in live_runs}
 
@@ -534,6 +537,12 @@ def overview(days: int = 7) -> dict[str, Any]:
                 oldest_count = counted_at
 
         live = live_by_config.get(config["name"])
+        scheduled = bool(config["enabled"] and config["scheduler_enabled"])
+        next_run = (
+            next_run_at(config.get("sync_interval_minutes"), last_started.get(config["name"]), now)
+            if scheduled
+            else None
+        )
         doctypes.append(
             {
                 "configuration": config["name"],
@@ -541,6 +550,9 @@ def overview(days: int = 7) -> dict[str, Any]:
                 "table": table_name_for(config["source_doctype"]),
                 "enabled": bool(config["enabled"]),
                 "scheduled": bool(config["scheduler_enabled"]),
+                "paused": bool(config["enabled"] and not config["scheduler_enabled"]),
+                "sync_interval": cint(config.get("sync_interval_minutes")) or 15,
+                "next_run": next_run.isoformat(sep=" ") if next_run else None,
                 "mode": config["sync_mode"] or "Full",
                 "delete_strategy": config["delete_strategy"] or "Ignore",
                 "cursor": config["last_sync_timestamp"],
@@ -697,6 +709,24 @@ def retry_failed() -> dict[str, Any]:
             else:
                 skipped.append(config["name"])
     return {"queued": queued, "skipped": skipped}
+
+
+@frappe.whitelist(methods=["POST"])
+def set_paused(configuration: str, paused: Any = 1) -> dict[str, Any]:
+    """Pause or resume one configuration's scheduled syncs.
+
+    Pausing turns off *Scheduler Enabled*: the scheduler skips the DocType
+    until it is resumed. Manual runs from the dashboard still work, and a
+    run already in progress is not stopped (use Stop for that).
+    """
+    _guard()
+    _config_or_throw(configuration)
+    if not frappe.has_permission(CONFIG_DOCTYPE, "write", configuration):
+        frappe.throw(_("You are not allowed to change {0}.").format(configuration), frappe.PermissionError)
+    pause = cint(paused) == 1
+    frappe.db.set_value(CONFIG_DOCTYPE, configuration, "scheduler_enabled", 0 if pause else 1)
+    frappe.db.commit()
+    return {"configuration": configuration, "paused": pause}
 
 
 @frappe.whitelist(methods=["POST"])

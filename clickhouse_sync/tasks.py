@@ -11,6 +11,8 @@ re-reading the engine.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import frappe
 from frappe.utils import add_to_date, cint, get_datetime, now_datetime
 
@@ -137,6 +139,25 @@ def is_due(interval_minutes: int, last_start: object, now: object) -> bool:
         return True
     elapsed = (get_datetime(now) - get_datetime(last_start)).total_seconds() / 60
     return elapsed >= interval_minutes - SCHEDULE_SLACK_MINUTES
+
+
+def next_run_at(interval_minutes: int, last_start: object, now: object):
+    """When the scheduler will next queue a configuration (a datetime).
+
+    The scheduler ticks every 15 minutes, at :00, :15, :30 and :45. A
+    configuration runs at the first tick at which :func:`is_due` is true.
+    """
+    now = get_datetime(now)
+    interval = max(cint(interval_minutes) or SCHEDULER_TICK_MINUTES, SCHEDULER_TICK_MINUTES)
+    earliest = now
+    if last_start and interval > SCHEDULER_TICK_MINUTES:
+        due = get_datetime(last_start) + timedelta(minutes=interval - SCHEDULE_SLACK_MINUTES)
+        earliest = max(now, due)
+    tick = earliest.replace(second=0, microsecond=0)
+    step = (-tick.minute) % SCHEDULER_TICK_MINUTES
+    if step == 0 and tick < earliest:
+        step = SCHEDULER_TICK_MINUTES
+    return tick + timedelta(minutes=step)
 
 
 def _enqueue_enabled_configs(trigger: str = "Scheduler") -> list[str]:

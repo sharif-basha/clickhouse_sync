@@ -16,7 +16,7 @@ you set, copies new and changed records into it, along with child tables
 flagged. A dashboard shows what is synced, what is running and what failed,
 and Telegram can alert you to failures.
 
-**Version:** 1.7.0 (plus the unreleased changes below) · **Frappe:** v15 ·
+**Version:** 1.8.0 · **Frappe:** v15 ·
 **ClickHouse:** any version with the HTTP interface (tested against 26.6) ·
 **License:** MIT
 
@@ -251,7 +251,8 @@ laid out like Frappe's own HR and Stock workspaces:
 
 | Section | What's there |
 | --- | --- |
-| Sync health | Number cards: syncs running now, failed today, failed this week, enabled DocTypes, records copied today, average run time |
+| Setup checklist | *Let's set up ClickHouse Sync*: connect, add a DocType, run the first sync, set up alerts. Steps tick off as you do them (System Managers) |
+| Sync health | Number cards: syncs running now, **oldest sync** (how long ago the least recently synced DocType was synced, and which one), failed today, failed this week, enabled DocTypes, records copied today |
 | Your Shortcuts | Sync Dashboard, Add a DocType, Sync Configurations (with the number enabled), Failed Syncs (with the number failed), Sync Logs, ClickHouse Settings |
 | Trends (last 30 days) | Records copied per day, runs by outcome, failures by DocType, average run time per day |
 | Setup, Monitoring & Reports | Links to settings, configurations, the dashboard, the logs and the four reports |
@@ -266,7 +267,7 @@ ClickHouse Sync Manager role.
 | Health | One verdict (Healthy / Attention / Action needed) with the reason, and whether ClickHouse is reachable |
 | Overall statistics | DocTypes configured, source records (MariaDB), warehouse records (ClickHouse), pending records, failed records and runs, synchronized %, last successful sync |
 | Live synchronization | One card per queued or running sync: phase, progress, records processed / written / inserted / updated / re-checked / skipped / failed, batch, cursor, speed, elapsed, time remaining, retry attempt, Stop |
-| DocTypes | Per DocType: status, source and warehouse counts, difference, pending, synced %, last success and failure, with Incremental / Full / Stop / Logs buttons; sortable and filterable |
+| DocTypes | Per DocType: status, source and warehouse counts, difference, pending, synced %, last success and failure, **next scheduled run** and its interval, with Incremental / Full / **Pause or Resume** / Stop / Logs buttons; sortable and filterable |
 | Errors | Recent failed runs with category, batch, retries and failed records; a full report per run (message, traceback, records in the failed batch); DocTypes failing now, with a retry button |
 | Analytics | Records written per day, runs per day by outcome, warehouse table sizes, recent runs, for 7 / 30 / 90 days |
 
@@ -299,7 +300,12 @@ single long statements), and as a lost worker if its job has left the queue.
 
 ## Telegram alerts
 
-Configure in **ClickHouse Settings → Alert Mode**:
+Alerts go to Telegram, email, or both: whichever you set up in **ClickHouse
+Settings**. For email, list addresses in **Alert Email Recipients** (comma or
+new line separated); they are sent through the site's outgoing email account.
+**Alerts → Send Test Alert** sends a test to every configured channel.
+
+Configure when alerts are sent in **ClickHouse Settings → Alert Mode**:
 
 - **Consolidated** (default): one digest per scheduler tick, sent only when a
   run failed, plus a once-daily heartbeat so you know the pipeline is alive.
@@ -328,7 +334,22 @@ WHERE docstatus = 1
 GROUP BY customer;
 ```
 
-With *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. A soft delete is
+**Easier: use the ready-made views.** For every table the app keeps a view
+named `v_` + the DocType, for example `v_sales_invoice`, that already applies
+`FINAL` and, with Soft Delete, leaves out deleted rows:
+
+```sql
+SELECT customer, sum(grand_total)
+FROM erp_warehouse.v_sales_invoice
+WHERE docstatus = 1
+GROUP BY customer;
+```
+
+The views are recreated when a table's columns change. They need the
+ClickHouse user to be allowed to create views (`GRANT ALL ON <db>.*` covers
+it); without that permission syncs still work and a warning is logged.
+
+When querying a table directly with *Soft Delete*, also add `WHERE _ch_is_deleted = 0`. A soft delete is
 written as a new version of the row with the flag set, so `FINAL` is what
 makes the flag visible. `_ch_synced_at` records when each row was written.
 
@@ -349,6 +370,8 @@ worker's OS time zone and are left as they are, so old and new rows agree.
 | Check source and warehouse agree | Dashboard → DocTypes → *Difference* column; menu → **Recount Records** for fresh counts |
 | Investigate a failure | Dashboard → Errors → **Details**, or the Failed Syncs report |
 | Sync a large DocType less often | Configuration form → **Sync Interval (Minutes)**, for example 1440 for daily |
+| Pause one DocType's scheduled syncs | Dashboard → DocTypes → **Pause** (and **Resume** later). Manual runs still work |
+| See when each DocType syncs next | Dashboard → DocTypes → *Next run* column |
 | Apply queued deletes now | `bench --site <site> execute clickhouse_sync.tasks.flush_pending_deletes` |
 
 **After upgrading from 1.7.0:** run **Reset Cursor** and then **Sync Now** on
@@ -441,7 +464,7 @@ first so no queued delete is left behind.
 | Max Threads, Max Insert Block Size | Passed to ClickHouse as query settings. |
 | Staleness Alert Hours | See Telegram alerts. |
 | Log Retention Days | Sync Logs older than this are deleted daily (default 90; 0 keeps all). |
-| Alert Mode, Alert On, Telegram Bot Token, Telegram Chat ID | See Telegram alerts. |
+| Alert Mode, Alert On, Telegram Bot Token, Telegram Chat ID, Alert Email Recipients | See [Telegram and email alerts](#telegram-alerts). |
 
 ### 2. ClickHouse Sync Configuration (one per DocType)
 
@@ -597,13 +620,30 @@ ClickHouse client and is reused by `ai_insights`.
 
 ## Changelog
 
-### Unreleased
+### 1.8.0 (2026-11-27)
 
-Three rounds of fixes from a full code review (pull request #4). Upgrading:
-follow [Install and update](#install-and-update); `bench migrate` adds four
-fields (Log Retention Days, Sync Interval, Cursor Safety Lag, Partition By
-Creation Month). Nothing changes for existing ClickHouse tables until you opt
-in.
+Upgrading: follow [Install and update](#install-and-update) and run
+`bench --site <site> migrate`. `bench version` now shows 1.8.0.
+
+#### Enhancements
+
+- **Setup checklist** on the workspace: connect, add a DocType, run the first
+  sync, set up alerts.
+- **Oldest Sync** card: how long ago the least recently synced DocType was
+  synced, and which one, or which has never synced.
+- Dashboard: **Next run** column (from each DocType's Sync Interval) and
+  **Pause / Resume** per DocType.
+- **Reporting views** `v_<doctype>` in ClickHouse that apply `FINAL` and hide
+  soft-deleted rows.
+- **Email alerts** alongside Telegram (**Alert Email Recipients**); the test
+  buttons send to every configured channel.
+
+#### Code review fixes
+
+Three rounds of fixes from a full code review (pull request #4). `bench
+migrate` adds their settings (Log Retention Days, Sync Interval, Cursor Safety
+Lag, Partition By Creation Month); nothing changes for existing ClickHouse
+tables until you opt in. The round-by-round details follow.
 
 #### Test Connection button
 

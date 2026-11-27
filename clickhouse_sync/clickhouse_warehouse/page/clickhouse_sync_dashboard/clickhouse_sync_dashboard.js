@@ -236,6 +236,9 @@ class ClickHouseSyncDashboard {
 				case "logs":
 					frappe.set_route("List", "ClickHouse Sync Log", { configuration: cfg });
 					break;
+				case "pause":
+					this._set_paused(cfg, btn.dataset.paused === "1");
+					break;
 				case "error":
 					this._show_error(btn.dataset.log);
 					break;
@@ -591,6 +594,7 @@ class ClickHouseSyncDashboard {
 			["sync_percent", __("Synced"), "num"],
 			["last_success", __("Last success"), ""],
 			["last_failure", __("Last failure"), ""],
+			["next_run", __("Next run"), ""],
 		];
 		const head = cols
 			.map(([k, label, cls]) => {
@@ -627,6 +631,11 @@ class ClickHouseSyncDashboard {
 						<button class="btn btn-default btn-xs" data-action="sync" data-mode="Incremental" data-config="${esc(r.configuration)}" ${live ? "disabled" : ""} title="${__("Start incremental sync")}">${__("Incremental")}</button>
 						<button class="btn btn-default btn-xs" data-action="sync" data-mode="Full" data-config="${esc(r.configuration)}" ${live ? "disabled" : ""} title="${__("Start full sync")}">${__("Full")}</button>
 						${live ? `<button class="btn btn-default btn-xs" data-action="stop" data-config="${esc(r.configuration)}">${__("Stop")}</button>` : ""}
+						<button class="btn btn-default btn-xs" data-action="pause" data-paused="${r.paused ? 0 : 1}" data-config="${esc(r.configuration)}" title="${
+							r.paused
+								? __("Resume scheduled syncs for this DocType")
+								: __("Pause scheduled syncs for this DocType (manual runs still work)")
+						}">${r.paused ? __("Resume") : __("Pause")}</button>
 						<button class="btn btn-link btn-xs" data-action="logs" data-config="${esc(r.configuration)}">${__("Logs")}</button>`;
 				return `<tr class="${r.enabled ? "" : "chsync-disabled"}">
 					<td>
@@ -642,6 +651,7 @@ class ClickHouseSyncDashboard {
 					<td class="num chsync-synced">${r.sync_percent == null ? "—" : `${r.sync_percent}%${meter(r.sync_percent, true)}`}</td>
 					<td>${r.last_success ? relative(r.last_success) : `<span class="text-muted">${__("never")}</span>`}</td>
 					<td>${r.last_failure ? relative(r.last_failure) : `<span class="text-muted">—</span>`}</td>
+					<td>${next_run_cell(r)}</td>
 					<td class="chsync-actions">${actions}</td>
 				</tr>`;
 			})
@@ -890,6 +900,18 @@ class ClickHouseSyncDashboard {
 			);
 	}
 
+	_set_paused(config, paused) {
+		frappe
+			.xcall(`${CHSYNC_API}.set_paused`, { configuration: config, paused: paused ? 1 : 0 })
+			.then(() =>
+				this._after_action(
+					paused
+						? __("Scheduled syncs paused for {0}", [config])
+						: __("Scheduled syncs resumed for {0}", [config])
+				)
+			);
+	}
+
 	_stop(config) {
 		frappe.confirm(
 			__("Stop the sync of {0}? It stops after the current batch; progress so far is kept and the next run resumes from there.", [`<b>${esc(config)}</b>`]),
@@ -983,6 +1005,26 @@ function num(value) {
 		return window.format_number(n, null, 0);
 	}
 	return n.toLocaleString();
+}
+
+function next_run_cell(r) {
+	if (!r.enabled) return `<span class="text-muted">—</span>`;
+	if (r.paused) return `<span class="chsync-pill chsync-neutral" title="${esc(__("Scheduled syncs are paused; manual runs still work"))}">${icon("pause")}${__("Paused")}</span>`;
+	if (!r.next_run) return `<span class="text-muted">—</span>`;
+	const when = frappe.datetime.str_to_obj(r.next_run);
+	const now = frappe.datetime.str_to_obj(frappe.datetime.now_datetime());
+	const minutes = Math.max(0, Math.round((when - now) / 60000));
+	const label =
+		minutes < 1
+			? __("next tick")
+			: minutes < 60
+			? __("in {0} min", [minutes])
+			: frappe.datetime.str_to_user(r.next_run);
+	const every = r.sync_interval >= 60 && r.sync_interval % 60 === 0
+		? __("every {0} h", [r.sync_interval / 60])
+		: __("every {0} min", [r.sync_interval]);
+	return `<span title="${esc(frappe.datetime.str_to_user(r.next_run))}">${esc(label)}</span>
+		<div class="text-muted small">${esc(every)}</div>`;
 }
 
 function relative(dt) {

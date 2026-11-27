@@ -82,6 +82,57 @@ def _resolve_credentials() -> "tuple[str, str] | None":
     return None
 
 
+def _email_recipients() -> list[str]:
+    """Addresses in ClickHouse Settings > Alert Email Recipients."""
+    try:
+        raw = _settings().get("alert_email_recipients") or ""
+    except Exception:  # noqa: BLE001 - settings unavailable: no email channel
+        return []
+    return [e.strip() for e in re.split(r"[,;\n]", raw) if e.strip()]
+
+
+def _channels() -> "tuple[tuple[str, str] | None, list[str]] | None":
+    """The configured alert channels: (Telegram credentials, email recipients).
+
+    ``None`` when neither is configured, i.e. alerting is simply off.
+    """
+    creds = _resolve_credentials()
+    emails = _email_recipients()
+    if not creds and not emails:
+        return None
+    return creds, emails
+
+
+def _as_html(message: str) -> str:
+    return message.replace("\n", "<br>")
+
+
+def _deliver(channels, message: str, subject: str) -> bool:
+    """Send ``message`` to every configured channel.
+
+    Returns ``True`` if at least one channel accepted it. Raises the first
+    error only when every channel failed.
+    """
+    creds, emails = channels
+    delivered = False
+    errors: list[Exception] = []
+    if creds:
+        token, chat_id = creds
+        try:
+            delivered = bool(_post(token, chat_id, message)) or delivered
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+    if emails:
+        try:
+            frappe.sendmail(recipients=emails, subject=subject, message=_as_html(message))
+            delivered = True
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+    if errors and not delivered:
+        raise errors[0]
+    return delivered
+
+
 def _should_alert(status: str) -> bool:
     mode = (_settings().get("alert_on") or "Failures").strip()
     if mode == "Never":
@@ -114,7 +165,7 @@ def _format_message(config_name: str, trigger: str, result: "SyncResult") -> str
 
 
 def send_run_alert(config_name: str, trigger: str, result: "SyncResult") -> None:
-    """Send a Telegram alert for a finished run, if configured. Never raises.
+    """Send a Telegram and/or email alert for a finished run. Never raises.
 
     In ``Consolidated`` mode, per-run sends are suppressed for scheduled runs
     (the batch digest covers them). Manual runs still alert immediately, since a
@@ -129,16 +180,15 @@ def send_run_alert(config_name: str, trigger: str, result: "SyncResult") -> None
         # Per Run mode, or a manual run: use the failure/all gate.
         if not _should_alert(result.status):
             return
-        creds = _resolve_credentials()
-        if not creds:
+        channels = _channels()
+        if not channels:
             return  # alerting simply not configured
-        token, chat_id = creds
         message = _format_message(config_name, trigger, result)
-        _post(token, chat_id, message)
+        _deliver(channels, message, f"ClickHouse Sync {result.status}: {config_name}")
     except Exception as exc:  # noqa: BLE001 - alerting must never disrupt a sync
         # Never log the traceback: a requests error carries the request URL,
         # and the bot token is part of that URL.
-        frappe.logger("clickhouse_sync").warning(f"Telegram alert failed: {_redact(str(exc))}")
+        frappe.logger("clickhouse_sync").warning(f"Sync alert failed: {_redact(str(exc))}")
 
 
 def _truncate(message: str) -> str:
@@ -174,17 +224,24 @@ def _post(token: str, chat_id: str, message: str) -> bool:
 
 @frappe.whitelist()
 def send_test_alert() -> dict:
-    """Send a test message to verify Telegram wiring from the settings form."""
+    """Send a test message to every configured channel from the settings form."""
     frappe.only_for("System Manager")
-    creds = _resolve_credentials()
-    if not creds:
-        return {"ok": False, "message": "No Telegram bot token / chat id configured."}
-    token, chat_id = creds
+    channels = _channels()
+    if not channels:
+        return {"ok": False, "message": "No alert channel configured: add a Telegram bot token and chat id, or email recipients."}
+    creds, emails = channels
     try:
-        _post(token, chat_id, "✅ <b>ClickHouse Sync</b>\nTest alert - Telegram is configured correctly.")
-        return {"ok": True, "message": f"Test message sent to chat {chat_id}."}
+        delivered = _deliver(
+            channels,
+            "✅ <b>ClickHouse Sync</b>\nTest alert - alerts are configured correctly.",
+            "ClickHouse Sync: test alert",
+        )
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "message": _redact(str(exc), token)}
+        return {"ok": False, "message": _redact(str(exc), creds[0] if creds else None)}
+    sent_to = ([f"Telegram chat {creds[1]}"] if creds else []) + ([", ".join(emails)] if emails else [])
+    if not delivered:
+        return {"ok": False, "message": "No channel accepted the test message; check the error log."}
+    return {"ok": True, "message": "Test alert sent to " + " and ".join(sent_to) + "."}
 
 
 # --------------------------------------------------------------------------- #
@@ -246,8 +303,8 @@ def send_batch_digest(window_minutes: int | None = None) -> "dict | None":
     try:
         if _alert_mode() != "Consolidated":
             return None
-        creds = _resolve_credentials()
-        if not creds:
+        channels = _channels()
+        if not channels:
             return None
 
         now = frappe.utils.now_datetime()
@@ -274,11 +331,14 @@ def send_batch_digest(window_minutes: int | None = None) -> "dict | None":
             _remember_digest(now)
             return {"sent": False, "reason": "no failures", "runs": len(runs)}
 
-        token, chat_id = creds
-        # Move the window on only once Telegram has the message: a failed
+        # Move the window on only once a channel has the message: a failed
         # send must leave these failures in the next digest's window.
         try:
-            delivered = _post(token, chat_id, _format_batch_message(runs, failures))
+            delivered = _deliver(
+                channels,
+                _format_batch_message(runs, failures),
+                f"ClickHouse Sync: {len(failures)} configuration(s) failed",
+            )
         except Exception:
             delivered = False
             raise
@@ -287,7 +347,7 @@ def send_batch_digest(window_minutes: int | None = None) -> "dict | None":
             # where this one did, so these failures are reported next time.
             _remember_digest(now if delivered else cutoff)
         if not delivered:
-            return {"sent": False, "reason": "telegram rejected the message"}
+            return {"sent": False, "reason": "no channel accepted the message"}
         return {"sent": True, "runs": len(runs), "failures": len(failures)}
     except Exception as exc:  # noqa: BLE001
         frappe.logger("clickhouse_sync").warning(f"batch digest failed: {_redact(str(exc))}")
@@ -303,8 +363,8 @@ def send_daily_heartbeat() -> "dict | None":
     try:
         if _alert_mode() != "Consolidated":
             return None
-        creds = _resolve_credentials()
-        if not creds:
+        channels = _channels()
+        if not channels:
             return None
 
         cutoff = frappe.utils.add_to_date(frappe.utils.now_datetime(), hours=-24)
@@ -338,8 +398,7 @@ def send_daily_heartbeat() -> "dict | None":
         if site:
             lines.append(f"\n<i>{site}</i>")
 
-        token, chat_id = creds
-        _post(token, chat_id, "\n".join(lines))
+        _deliver(channels, "\n".join(lines), "ClickHouse Sync: daily summary")
         return {"sent": True, "total": total, "failed": failed}
     except Exception as exc:  # noqa: BLE001
         frappe.logger("clickhouse_sync").warning(f"daily heartbeat failed: {_redact(str(exc))}")
@@ -379,9 +438,10 @@ def send_test_digest() -> dict:
     form without waiting for a real failure.
     """
     frappe.only_for("System Manager")
-    creds = _resolve_credentials()
-    if not creds:
-        return {"ok": False, "message": "No Telegram bot token / chat id configured."}
+    channels = _channels()
+    if not channels:
+        return {"ok": False, "message": "No alert channel configured: add a Telegram bot token and chat id, or email recipients."}
+    creds = channels[0]
 
     cutoff = frappe.utils.add_to_date(frappe.utils.now_datetime(), hours=-24)
     logs = frappe.get_all(
@@ -399,9 +459,8 @@ def send_test_digest() -> dict:
     runs = list(latest.values())
     failures = [r for r in runs if r["status"] not in _NOT_FAILURES]
 
-    token, chat_id = creds
     try:
-        _post(token, chat_id, _format_batch_message(runs, failures or []))
+        _deliver(channels, _format_batch_message(runs, failures or []), "ClickHouse Sync: test digest")
         return {"ok": True, "message": f"Test digest sent ({len(runs)} configs, {len(failures)} failing)."}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "message": _redact(str(exc), token)}
+        return {"ok": False, "message": _redact(str(exc), creds[0] if creds else None)}

@@ -113,6 +113,48 @@ def count_running_syncs(configuration: str | None = None) -> int:
     return running
 
 
+def _age_text(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return _("just now")
+    if minutes < 60:
+        return _("{0} min ago").format(minutes)
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return _("{0} h {1} min ago").format(hours, minutes)
+    days, hours = divmod(hours, 24)
+    return _("{0} d {1} h ago").format(days, hours)
+
+
+def freshness_summary(configs: list[dict], now: Any) -> str:
+    """How out of date the warehouse is, as one line for a number card.
+
+    Names the enabled DocType whose last successful sync is the oldest
+    (its sync position, *Last Sync Timestamp*), or one that has never synced.
+    """
+    if not configs:
+        return _("No DocTypes enabled")
+    never = [c["source_doctype"] for c in configs if not c.get("last_sync_timestamp")]
+    if never:
+        more = _(" (+{0} more)").format(len(never) - 1) if len(never) > 1 else ""
+        return _("Never synced: {0}{1}").format(never[0], more)
+    oldest = min(configs, key=lambda c: get_datetime(c["last_sync_timestamp"]))
+    age = (get_datetime(now) - get_datetime(oldest["last_sync_timestamp"])).total_seconds()
+    return f"{_age_text(max(age, 0))} · {oldest['source_doctype']}"
+
+
+@frappe.whitelist()
+def data_freshness_card() -> dict[str, Any]:
+    """Data source for the "Oldest Sync" number card (Custom card)."""
+    _guard()
+    configs = frappe.get_all(
+        "ClickHouse Sync Configuration",
+        filters={"enabled": 1},
+        fields=["source_doctype", "last_sync_timestamp"],
+    )
+    return {"value": freshness_summary(configs, now_datetime()), "fieldtype": "Data"}
+
+
 @frappe.whitelist()
 def running_syncs_card() -> dict[str, Any]:
     """Data source for the "Running Syncs" number card (Custom card)."""

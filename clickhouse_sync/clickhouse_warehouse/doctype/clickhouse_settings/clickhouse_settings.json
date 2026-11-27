@@ -30,7 +30,8 @@
   "alert_mode",
   "alert_on",
   "telegram_bot_token",
-  "telegram_chat_id"
+  "telegram_chat_id",
+  "alert_email_recipients"
  ],
  "fields": [
   {
@@ -166,7 +167,7 @@
   {
    "fieldname": "telegram_section",
    "fieldtype": "Section Break",
-   "label": "Telegram Alerts",
+   "label": "Alerts (Telegram and email)",
    "collapsible": 1
   },
   {
@@ -191,6 +192,12 @@
    "description": "Chat or group id that receives sync alerts."
   },
   {
+   "fieldname": "alert_email_recipients",
+   "fieldtype": "Small Text",
+   "label": "Alert Email Recipients",
+   "description": "Email addresses for sync alerts, separated by commas or new lines. Uses the site's outgoing email account. Leave empty to send alerts only to Telegram."
+  },
+  {
    "fieldname": "alert_mode",
    "fieldtype": "Select",
    "label": "Alert Mode",
@@ -202,7 +209,7 @@
  "index_web_pages_for_search": 0,
  "issingle": 1,
  "links": [],
- "modified": "2026-11-26 00:00:00.000000",
+ "modified": "2026-11-27 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "ClickHouse Warehouse",
  "name": "ClickHouse Settings",
