@@ -348,6 +348,7 @@ DocTypes outside working hours.
 | Symptom | Likely cause and fix |
 | --- | --- |
 | Dashboard looks unstyled or shows stray `<div …>` text | The browser is running a cached old script. Avatar menu → **Reload**, or open the page in a private window. Check the code is deployed: `grep -c chsync-dash-style clickhouse_sync/clickhouse_warehouse/page/clickhouse_sync_dashboard/clickhouse_sync_dashboard.js` prints 1 or more. |
+| "Page clickhouse-sync-log not found" | Fixed in this version: the Sync Log DocType was flagged *User Cannot Search*, which makes Frappe hide a read-only DocType from Desk for everyone except Administrator. Update and run `bench --site <site> migrate`, or on an older version run `bench --site <site> execute frappe.db.set_value --args "['DocType', 'ClickHouse Sync Log', 'read_only', 0]"` and `bench --site <site> clear-cache`, then log in again. |
 | "ClickHouse unreachable" | Check host, port and Secure in ClickHouse Settings, and that the server's HTTP interface is reachable from the bench host. |
 | Syncs stay *Queued* | No background worker is running the `long` queue. In development keep `bench start` running; in production check `sudo supervisorctl status`. |
 | Stop does nothing | The Redis cache isn't reachable (check `redis-cli -p <port> ping` using the `redis_cache` port in `sites/common_site_config.json`). |
@@ -589,6 +590,13 @@ follow [Install and update](#install-and-update); `bench migrate` adds four
 fields (Log Retention Days, Sync Interval, Cursor Safety Lag, Partition By
 Creation Month). Nothing changes for existing ClickHouse tables until you opt
 in.
+
+#### Desk fix
+
+- `/app/clickhouse-sync-log` no longer shows "Page not found". The Sync Log
+  DocType was flagged *User Cannot Search* (`read_only`); because the log is
+  read-only for every role, Frappe left it out of Desk's routes for everyone
+  but Administrator. A test now keeps read-only DocTypes reachable.
 
 #### Review fixes, round 3
 
