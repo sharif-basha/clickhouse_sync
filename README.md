@@ -555,8 +555,8 @@ on its Source DocType.
 
 ## License and trademarks
 
-Released under the [MIT License](license.txt). Copyright (c) 2026 RySS /
-Common Ground Initiative and contributors.
+Released under the [MIT License](license.txt). Copyright (c) 2026 Sharif Basha
+and contributors.
 
 ClickHouse is a trademark of ClickHouse, Inc. This project is not affiliated
 with or endorsed by ClickHouse, Inc. Frappe, ERPNext, Telegram and Superset

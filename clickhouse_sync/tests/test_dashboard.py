@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 # For license information, please see license.txt
 """Tests for the monitoring dashboard API and the live run record.
 

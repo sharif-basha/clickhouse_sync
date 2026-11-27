@@ -1,4 +1,4 @@
-// Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+// Copyright (c) 2026, Sharif Basha and contributors
 frappe.query_reports["Sync Summary"] = {
 	filters: [
 		{ fieldname: "from_date", label: __("From Date"), fieldtype: "Datetime" },

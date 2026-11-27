@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 # For license information, please see license.txt
 """Licensing, links and data-protection safeguards that should not regress."""
 
@@ -27,7 +27,7 @@ class TestLicensing(unittest.TestCase):
         # Every source file header points to license.txt.
         text = (ROOT / "license.txt").read_text()
         self.assertIn("MIT License", text)
-        self.assertIn("RySS / Common Ground Initiative", text)
+        self.assertIn("Sharif Basha", text)
 
     def test_package_metadata_declares_the_license(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text()

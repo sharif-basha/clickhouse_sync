@@ -1,4 +1,4 @@
-// Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+// Copyright (c) 2026, Sharif Basha and contributors
 frappe.ui.form.on("ClickHouse Settings", {
 	refresh(frm) {
 		frm.add_custom_button(__("Test Connection"), () => {

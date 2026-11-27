@@ -1,4 +1,4 @@
-# Copyright (c) 2026, RySS / Common Ground Initiative and contributors
+# Copyright (c) 2026, Sharif Basha and contributors
 """Documentation site configuration for clickhouse_sync."""
 
 source_link = "https://github.com/sharif-basha/clickhouse_sync"
